@@ -1,6 +1,8 @@
-"""Read-only validation for the 20-aspect sentiment classification CSVs.
+"""只读校验含二十个方面标签的情感分类数据集，输出报告和问题明细。
 
-Only the Python standard library is required. Run with --help for CLI options.
+校验使用 Python 标准库，不修改输入文本、标签或既有复核决定。结构错误、
+重复问题和统计告警分别记录，扫描是否完成与是否通过校验也分别表达。
+命令行参数可通过 --help 查看。
 """
 
 from __future__ import annotations
@@ -18,6 +20,11 @@ import re
 import sys
 import tempfile
 import unicodedata
+
+try:
+    from .dataset_io import receipt_path
+except ImportError:
+    from dataset_io import receipt_path
 
 
 try:
@@ -40,11 +47,12 @@ WHITESPACE_PATTERN = re.compile(r"\s+")
 
 
 def normalize_for_comparison(text: str) -> str:
-    """Preserve word boundaries and original text; normalize only comparison keys."""
+    """仅生成比较用的归一化键，不改变原文，连续空白仍保留一个分词边界。"""
     return WHITESPACE_PATTERN.sub(" ", unicodedata.normalize("NFC", text)).strip()
 
 
 def file_sha256(path: Path) -> str:
+    """分块计算文件摘要，避免将整份数据一次读入内存。"""
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -54,6 +62,11 @@ def file_sha256(path: Path) -> str:
 
 @dataclass(slots=True)
 class Record:
+    """保存一条已解析记录及其来源位置，供重复检查和原始证据导出使用。
+
+    记录序号按解析后的数据记录计数；物理结束行号仅用于排查多行文本，
+    两者不能互换。无法解析的标签以空值保留，不猜测或修正原始标签。
+    """
     split: str
     sample_id: str
     record_number: int
@@ -62,6 +75,7 @@ class Record:
     labels: tuple[int | None, ...]
 
     def as_dict(self) -> dict:
+        """按固定方面顺序导出标签，保留原文和完整的记录定位信息。"""
         return {
             "split": self.split,
             "id": self.sample_id,
@@ -73,12 +87,14 @@ class Record:
 
 
 class IssueCollector:
+    """统一保存发现，并将每项发现绑定到规则版本和对应输入摘要。"""
     def __init__(self, stage: str):
         self.stage = stage
         self.items: list[dict] = []
         self.sources: dict[str, str | None] = {}
 
     def add(self, rule_id: str, severity: str, message: str, *, records=(), **details):
+        """根据问题内容生成稳定编号，初始复核状态不代表问题已获批准。"""
         source_splits = {record.split for record in records}
         if "split" in details:
             source_splits.add(details["split"])
@@ -93,6 +109,7 @@ class IssueCollector:
             "records": [record.as_dict() for record in records],
             **details,
         }
+        # 编号只依赖规则、来源和证据，不包含运行时间，便于重复扫描时关联旧决定。
         identity = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         item["issue_id"] = "issue_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
         item["review"] = {
@@ -107,10 +124,11 @@ class IssueCollector:
 
 
 class UnusableHeader(Exception):
-    """The header cannot be interpreted safely; retain an incomplete scan."""
+    """表头无法可靠解释时中止该文件扫描，并保留扫描未完成的状态。"""
 
 
 def _label_conflicts(records: list[Record]) -> dict:
+    """逐方面列出存在不同有效标签的组成员，不将缺失标签当作新类别。"""
     conflicts = {}
     for index, aspect in enumerate(ASPECT_COLUMNS):
         values = {record.labels[index] for record in records if record.labels[index] is not None}
@@ -124,6 +142,7 @@ def _label_conflicts(records: list[Record]) -> dict:
 
 
 def _length_summary(lengths: list[int]) -> dict:
+    """汇总原始字符长度，分位数采用最近秩法，不在此设置长度阈值。"""
     if not lengths:
         return {"count": 0, "min": None, "max": None, "mean": None,
                 "p50": None, "p95": None, "p99": None}
@@ -138,6 +157,11 @@ def _length_summary(lengths: list[int]) -> dict:
 def _scan_file(split: str, path: Path, allowed_labels: tuple[int, ...],
                collector: IssueCollector, max_text_chars: int | None,
                min_class_fraction: float | None) -> tuple[dict, list[Record]]:
+    """扫描单个文件，保留可定位的问题证据，并标明所有统计是否完整。
+
+    列宽异常只跳过该条记录，后续记录仍继续扫描；表头歧义、解码或解析
+    失败则不能声称扫描完成。读取前后的文件摘要用于发现并发修改。
+    """
     info = {
         "path": str(path), "sha256": None, "sha256_after_scan": None,
         "size_bytes": None, "scan_complete": False, "records_scanned": 0,
@@ -176,11 +200,12 @@ def _scan_file(split: str, path: Path, allowed_labels: tuple[int, ...],
                 collector.add("column_order", "ERROR", "列顺序与固定规范不一致。", split=split,
                               expected_columns=list(EXPECTED_COLUMNS), actual_columns=header)
             if missing or duplicate:
-                # No unambiguous field interpretation is possible; do not claim a complete scan.
+                # 缺列或重名列会造成字段解释歧义，不能继续按固定列含义统计。
                 raise UnusableHeader
             positions = {name: header.index(name) for name in EXPECTED_COLUMNS}
 
             for record_number, row in enumerate(reader, start=1):
+                # 使用 CSV 解析器的记录边界，多行评论仍是一条样本，不能按物理行拆分。
                 info["records_scanned"] = record_number
                 if len(row) != len(header):
                     sequential_ids = False
@@ -223,6 +248,7 @@ def _scan_file(split: str, path: Path, allowed_labels: tuple[int, ...],
                     char for char in text if char == "\ufffd"
                     or (unicodedata.category(char) == "Cc" and char not in "\t\n\r")
                 )
+                # 正常制表符和换行允许保留；异常控制符只发告警，由后续复核决定处理。
                 if suspicious:
                     collector.add("suspicious_characters", "WARN", "文本含替换字符或异常控制字符，需按内容判断。",
                                   records=[record], characters={f"U+{ord(c):04X}": n for c, n in sorted(suspicious.items())})
@@ -238,7 +264,7 @@ def _scan_file(split: str, path: Path, allowed_labels: tuple[int, ...],
                       records_scanned=info["records_scanned"],
                       physical_line_end=reader.line_num if reader is not None else None)
 
-    # A changed source invalidates statistics even when CSV parsing reached EOF.
+    # 即使解析器读到了文件末尾，读取期间源文件发生变化也会使本次统计失效。
     if info["sha256"] is not None:
         try:
             info["sha256_after_scan"] = file_sha256(path)
@@ -259,6 +285,7 @@ def _scan_file(split: str, path: Path, allowed_labels: tuple[int, ...],
         "denominator": "records_with_valid_width",
     }
     info["label_distribution"] = {}
+    # 每个方面的比例只以该方面的有效标签为分母；不完整扫描不触发分布阈值判断。
     for aspect, counter in label_counts.items():
         valid_count = sum(counter.values())
         info["label_distribution"][aspect] = {
@@ -277,6 +304,7 @@ def _scan_file(split: str, path: Path, allowed_labels: tuple[int, ...],
                               split=split, aspect=aspect, missing_classes=missing_classes,
                               valid_label_count=valid_count)
             if min_class_fraction is not None:
+                # 零占比已经由缺失类别告警覆盖，这里只报告非零但低于显式阈值的类别。
                 low = {str(value): counter[value] / valid_count for value in allowed_labels
                        if 0 < counter[value] / valid_count < min_class_fraction}
                 if low:
@@ -289,6 +317,11 @@ def _scan_file(split: str, path: Path, allowed_labels: tuple[int, ...],
 
 
 def _check_groups(records: list[Record], collector: IssueCollector, id_scope: str) -> dict:
+    """分别检查编号、完全重复和归一化重复，保留整组成员及逐方面冲突。
+
+    集合间编号能否复用由调用方的编号作用域决定。文本相等仅证明比较键
+    相同，不据此自动删除记录，也不将训练标签作为验证标签的替代真值。
+    """
     by_id = defaultdict(list)
     exact = defaultdict(list)
     normalized = defaultdict(list)
@@ -322,7 +355,7 @@ def _check_groups(records: list[Record], collector: IssueCollector, id_scope: st
             if len(group) < 2:
                 continue
             if comparison == "normalized" and len({record.text for record in group}) == 1:
-                # This group was already reported in the exact pass.
+                # 整组原文完全相同时，完全重复检查已经报告，不再重复生成归一化问题。
                 continue
             cross_split = len({record.split for record in group}) > 1
             conflicts = _label_conflicts(group)
@@ -344,12 +377,18 @@ def _check_groups(records: list[Record], collector: IssueCollector, id_scope: st
                           label_conflicts=conflicts, record_count=len(group),
                           extra_records=len(group) - 1,
                           note="归一化仅用于比较；保留原文，不自动删除、改标签或判定为同一原始评论。")
+    # 完全重复子组可能包含在更大的归一化组内，因此受影响记录数需要按来源去重。
     summary["unique_records_in_duplicate_groups"] = len(affected_records)
     summary["unique_records_in_cross_split_groups"] = len(cross_split_records)
     return summary
 
 
 def _write_json_atomic(path: Path, value, *, jsonl: bool = False):
+    """先在目标目录写临时文件，再原子替换，避免读者看到半份报告。
+
+    每个 JSONL 对象只追加一个真正的换行；字符串内部字符由 JSON 编码器
+    处理。调用方负责判断目标是否允许覆盖，本函数仅保证单文件发布完整。
+    """
     temporary = None
     try:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", suffix=".tmp",
@@ -369,11 +408,12 @@ def _write_json_atomic(path: Path, value, *, jsonl: bool = False):
 
 def validate_dataset(split_paths: dict[str, Path], output_dir: Path, *, stage: str = "raw",
                      id_scope: str = "split", max_text_chars: int | None = None,
-                     min_class_fraction: float | None = None) -> dict:
-    """Validate input CSVs without editing them; return the persisted JSON report.
+                     min_class_fraction: float | None = None, root: Path | None = None) -> dict:
+    """只读检查输入 CSV，落盘问题明细及汇总报告，并返回同一份报告内容。
 
-    `mapped` checks processed CSV structure and labels, not source-to-output lineage.
-    No review decisions are automatically applied or overwritten by this function.
+    原始阶段和映射阶段使用不同合法标签域。映射阶段只验证文件自身，
+    不能证明标签映射及样本增减与来源一致；这些需要独立来源对账。
+    本函数不应用或覆盖复核决定，报告中的待复核问题仍需明确处理。
     """
     if not split_paths or any(not isinstance(name, str) or not name for name in split_paths):
         raise ValueError("至少提供一个非空集合名及其 CSV 路径。")
@@ -391,6 +431,7 @@ def validate_dataset(split_paths: dict[str, Path], output_dir: Path, *, stage: s
     output_dir = Path(output_dir).resolve()
     if len(set(paths.values())) != len(paths):
         raise ValueError("不同集合不能指向同一个输入文件。")
+    # 写报告之前限制输出位置，防止报告混入输入目录或经符号链接覆盖其他文件。
     for path in paths.values():
         if output_dir.is_relative_to(path.parent):
             raise ValueError("报告目录不能位于输入数据所在目录及其子目录中。")
@@ -405,6 +446,7 @@ def validate_dataset(split_paths: dict[str, Path], output_dir: Path, *, stage: s
     files = {}
     records = []
     previous_limit = csv.field_size_limit()
+    # 长评论可能超过 CSV 库默认限制；兼容平台整数范围，并在扫描后恢复进程原设置。
     field_limit = sys.maxsize
     while True:
         try:
@@ -422,6 +464,7 @@ def validate_dataset(split_paths: dict[str, Path], output_dir: Path, *, stage: s
     duplicate_summary = _check_groups(records, collector, id_scope)
     issue_counts = {severity: sum(item["severity"] == severity for item in collector.items)
                     for severity in ("ERROR", "REVIEW", "WARN")}
+    # 严重程度决定校验状态；是否完整扫描另外保留，不能以读完文件等同于通过。
     if issue_counts["ERROR"]:
         status = "failed"
     elif issue_counts["REVIEW"]:
@@ -482,19 +525,28 @@ def validate_dataset(split_paths: dict[str, Path], output_dir: Path, *, stage: s
         },
     }
     output_dir.mkdir(parents=True, exist_ok=True)
+    # 先发布明细并计算实际文件摘要，再把该摘要写入汇总，建立后续复核的来源绑定。
     _write_json_atomic(output_dir / "validation_issues.jsonl", collector.items, jsonl=True)
     report["artifacts"]["issues_sha256"] = file_sha256(output_dir / "validation_issues.jsonl")
+    # 项目内路径按根目录保存为相对路径；外部输入保留绝对位置，便于迁移后明确定位。
+    for info in report["files"].values():
+        info["path"] = receipt_path(Path(info["path"]), root)
+    for field in ("issues", "report"):
+        report["artifacts"][field] = receipt_path(Path(report["artifacts"][field]), root)
+    report["review_policy"]["decisions_file"] = receipt_path(output_dir / "review_decisions.jsonl", root)
     _write_json_atomic(output_dir / "validation_report.json", report)
     return report
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Keep redirected CLI output readable on Windows, independently of the code page.
+    """解析命令行参数；结构失败、待复核和通过分别使用不同退出码。"""
+    # 显式使用 UTF-8，避免 Windows 控制台代码页影响重定向后的中文报告。
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="只读校验细粒度情感数据集，输出 JSON 报告和 JSONL 异常明细。")
-    parser.add_argument("--raw-dir", "--input-dir", type=Path, default=PROJECT_ROOT / "data" / "raw",
+    parser.add_argument("--root", type=Path, default=PROJECT_ROOT, help="项目根目录，凭据保存该目录内的相对路径。")
+    parser.add_argument("--raw-dir", "--input-dir", type=Path, default=None,
                         help="输入 CSV 目录（默认项目 data/raw；mapped 模式也可传处理后目录）。")
     parser.add_argument("--train-csv", type=Path, help="覆盖训练集文件路径。")
     parser.add_argument("--validation-csv", type=Path, help="覆盖验证集文件路径。")
@@ -505,14 +557,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-text-chars", type=int, default=None)
     parser.add_argument("--min-class-fraction", type=float, default=None)
     args = parser.parse_args(argv)
+    input_dir = args.raw_dir or args.root / "data/raw"
     paths = {
-        "train": args.train_csv if args.train_csv is not None else args.raw_dir / "sentiment_analysis_trainingset.csv",
-        "validation": args.validation_csv if args.validation_csv is not None else args.raw_dir / "sentiment_analysis_validationset.csv",
+        "train": args.train_csv if args.train_csv is not None else input_dir / "sentiment_analysis_trainingset.csv",
+        "validation": args.validation_csv if args.validation_csv is not None else input_dir / "sentiment_analysis_validationset.csv",
     }
     try:
-        output_dir = args.output_dir if args.output_dir is not None else PROJECT_ROOT / "data" / "reports" / args.stage
+        output_dir = args.output_dir if args.output_dir is not None else args.root / "data" / "reports" / args.stage
         report = validate_dataset(paths, output_dir, stage=args.stage, id_scope=args.id_scope,
-                                  max_text_chars=args.max_text_chars, min_class_fraction=args.min_class_fraction)
+                                  max_text_chars=args.max_text_chars, min_class_fraction=args.min_class_fraction, root=args.root)
     except (ValueError, OSError) as error:
         parser.error(str(error))
     print(json.dumps({"status": report["status"], "scan_complete": report["scan_complete"],

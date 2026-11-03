@@ -1,4 +1,8 @@
-"""Behavioral tests for the CSV validation gate; no repository data is required."""
+"""验证 CSV 校验流程的对外行为，所有样本均在临时目录构造。
+
+测试同时关注错误发现、扫描完整性和原始字节保护，不依赖仓库实际数据，
+也不把生成报告本身当作输入未被改动的证据。
+"""
 
 import csv
 import hashlib
@@ -12,6 +16,7 @@ from scripts.validate_dataset import ASPECT_COLUMNS, validate_dataset
 
 class DatasetValidationTests(unittest.TestCase):
     def setUp(self):
+        """隔离输入与报告目录，避免异常样本和重复运行影响真实数据。"""
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.root = Path(self.temp_dir.name)
@@ -21,6 +26,7 @@ class DatasetValidationTests(unittest.TestCase):
         self.header = ["id", "content", *ASPECT_COLUMNS]
 
     def write_csv(self, split, rows, header=None):
+        """通过 CSV 写入器保留引号和多行字段，也允许显式构造异常表头。"""
         path = self.raw_dir / f"{split}.csv"
         with path.open("w", encoding="utf-8", newline="") as stream:
             writer = csv.writer(stream)
@@ -35,6 +41,7 @@ class DatasetValidationTests(unittest.TestCase):
         return [sample_id, text, *(labels[aspect] for aspect in ASPECT_COLUMNS)]
 
     def baseline_rows(self, split, labels=(-2, -1, 0, 1)):
+        """为每个方面准备四类标签，避免无关的缺失类别告警干扰目标断言。"""
         return [self.row(str(i), f"{split} 独立评论 {i}", label)
                 for i, label in enumerate(labels)]
 
@@ -44,6 +51,7 @@ class DatasetValidationTests(unittest.TestCase):
                 if line.strip()]
 
     def validate(self, files, **kwargs):
+        """除检查返回值外，还确认落盘报告与调用方实际看到的结果一致。"""
         report = validate_dataset(files, self.output_dir, **kwargs)
         saved_report = json.loads(
             (self.output_dir / "validation_report.json").read_text(encoding="utf-8")
@@ -52,6 +60,7 @@ class DatasetValidationTests(unittest.TestCase):
         return report
 
     def test_valid_csv_preserves_quoted_multiline_text_and_input_bytes(self):
+        """一条评论内的逗号、引号和换行不能改变记录数，也不能触发原文重写。"""
         rows = self.baseline_rows("train")
         text = '好吃, 他说"下次再来"\n第二行仍属于同一条评论'
         rows[0] = self.row("0", text)
@@ -87,6 +96,7 @@ class DatasetValidationTests(unittest.TestCase):
                 self.assertGreater(report["issue_counts"]["ERROR"], 0)
 
     def test_wrong_record_width_is_an_error_without_truncating_the_scan(self):
+        """列宽错误应单独报告，不能让后续有效记录从统计中消失。"""
         for width_change in (-1, 1):
             with self.subTest(width_change=width_change):
                 row = self.row("bad", "列数不一致")
@@ -100,6 +110,7 @@ class DatasetValidationTests(unittest.TestCase):
                 self.assertEqual(report["files"]["train"]["records_scanned"], 2)
 
     def test_unterminated_quote_marks_the_scan_incomplete(self):
+        """解析器无法确定记录边界时保留已读条数，并明确标记扫描未完成。"""
         path = self.write_csv("train", [self.row("ok", "完整记录")])
         with path.open("a", encoding="utf-8", newline="") as stream:
             stream.write('broken,"unterminated')
@@ -175,6 +186,7 @@ class DatasetValidationTests(unittest.TestCase):
         self.assertGreater(report["issue_counts"]["ERROR"] + report["issue_counts"]["REVIEW"], 0)
 
     def test_normalized_cross_split_overlap_has_original_text_and_aspect_conflicts(self):
+        """归一化仅用于发现候选重叠，问题证据仍须保留原文和逐方面标签。"""
         train_text = "Cafe\u0301  很好\n吃"
         validation_text = "Caf\u00e9 很好 吃"
         train = self.write_csv("train", [self.row("t1", train_text, dish_taste=1)])
@@ -220,6 +232,7 @@ class DatasetValidationTests(unittest.TestCase):
                             for issue in self.read_issues()))
 
     def test_mapped_stage_accepts_zero_through_three_and_rejects_negative_two(self):
+        """切换阶段只切换合法标签域，不据此宣称已验证来源到输出的映射关系。"""
         path = self.write_csv("train", self.baseline_rows("mapped", labels=(0, 1, 2, 3)))
         report = self.validate({"train": path}, stage="mapped")
         self.assertEqual(report["status"], "passed")
@@ -249,6 +262,7 @@ class DatasetValidationTests(unittest.TestCase):
         self.assertGreater(report["issue_counts"]["WARN"], 0)
 
     def test_issue_ids_and_source_hashes_are_stable_and_existing_decisions_survive(self):
+        """相同输入的重复扫描应产生稳定编号，同时原封保留既有人工决定文件。"""
         files = {
             "train": self.write_csv("train", [self.row("t1", "同一  文本", dish_taste=1)]),
             "validation": self.write_csv("validation", [
@@ -292,6 +306,7 @@ class DatasetValidationTests(unittest.TestCase):
                          [issue["source_sha256"] for issue in first_issues])
 
     def test_exact_subgroup_and_normalized_parent_use_distinct_group_and_record_counts(self):
+        """重复子组与较大归一化组可以并存，组数相加不能当作唯一受影响样本数。"""
         train = self.write_csv("train", [
             self.row("t1", "口味 好", dish_taste=1),
             self.row("t2", "口味 好", dish_taste=0),
@@ -320,6 +335,7 @@ class DatasetValidationTests(unittest.TestCase):
                          {"exact": 2, "normalized": 4})
 
     def test_output_inside_raw_is_rejected_without_touching_input(self):
+        """危险的输出位置必须在写入前拒绝，并以字节比较确认输入未受影响。"""
         path = self.write_csv("train", self.baseline_rows("train"))
         original = path.read_bytes()
 

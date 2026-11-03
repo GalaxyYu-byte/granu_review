@@ -239,3 +239,36 @@ python .\scripts\audit_processed_dataset.py --output-dir .\data\reports\processe
 ```
 
 自动化部分复算所有记录差异与来源；语义意见仍需结合原文阅读，不能从脚本通过推导出全部标签正确。
+
+## 复核流程的执行约束
+
+处理前必须满足 `review_complete=true`，并且每条决定均为
+`status=reviewed_pending_application`、`action_applied=false`。待复核、被否决、
+已经应用或缺失状态的决定都会被拒绝，不生成处理产物。
+
+重复问题按已复核证据区分处理：集合内标签一致的完全或归一化重复使用
+`retain_reviewed_records` 保留所有记录；训练集标签冲突仍隔离；跨集合重叠仍只隔离训练侧。
+验证集内部的冲突保留原文和标签，并继续记录为争议，不能视为已经重标。
+争议成员从实际冲突组推导，不固定写成两条。
+
+对明确批准保留的重复组，二次校验只允许成员、原文及标签与复核方案一致的问题通过。
+校验报告保留扫描发现的 `issue_counts`，另写 `scan_status` 和 `review_resolutions`
+说明哪些问题引用了原复核决定；新的未批准 REVIEW 仍阻止发布。
+独立审计会重新核对原始问题、复核状态、汇总摘要、动作目标、应用日志、文本编辑日志和实际 CSV，
+即使同步更新某一份日志的文件摘要，也不能绕过这些交叉检查。
+
+三个复核、处理和审计脚本共用按物理文件行读取的 JSONL 函数。
+评论内的 U+0085、U+2028、U+2029 不会再把一条 JSON 记录误拆成多行。
+字符是否删除仍由逐条复核决定控制，JSONL 读取本身不清洗文本。
+
+新凭据将项目内文件保存为相对于项目根目录的路径，同时保留 SHA-256；
+项目外的明确输入保留绝对路径。迁移时复制整个项目的 `data` 目录即可，
+旧绝对路径凭据也会根据报告原位置绑定到新根目录，不依赖旧目录是否仍存在。
+四个命令都支持 `--root`，默认使用脚本所在项目的根目录，例如只读复核数据副本：
+
+```powershell
+python .\scripts\audit_processed_dataset.py --root D:\dataset_copy --output-dir D:\dataset_copy\data\reports\processed_review_rerun
+```
+
+原始数据、既有决定、清洗结果和验证集标签均作为历史版本保留。
+上述修改修复后续执行和审计规则；标签修订候选仍须在口径确认后另存版本。
