@@ -4,11 +4,24 @@
 
 ## 运行
 
-需要 Python 3.10 或更新版本，无需安装第三方依赖。在项目根目录执行：
+项目使用 [uv](https://docs.astral.sh/uv/getting-started/installation/) 管理 Python 环境和依赖，支持 Python 3.10 或更新版本；`.python-version` 默认选择 Python 3.13。脚本和测试只使用标准库，默认不安装第三方依赖。安装 uv 后，在项目根目录执行：
 
 ```powershell
-python .\scripts\validate_dataset.py
+uv sync --locked
+uv run python .\scripts\validate_dataset.py
 ```
+
+`uv sync --locked` 按已提交的 `uv.lock` 创建或同步 `.venv`；本机没有匹配的 Python 时，uv 会自动下载。后续使用 `uv run` 执行命令，无需手动激活环境。`pyproject.toml`、`uv.lock` 和 `.python-version` 纳入版本控制，`.venv` 和本地缓存不提交。
+
+新增运行依赖使用 `uv add <包名>`，开发工具使用 `uv add --dev <包名>`，删除依赖使用 `uv remove <包名>`；依赖配置和锁文件应一并提交。
+
+运行 `notebooks/` 中的 Notebook 时，安装可选的内核和格式依赖：
+
+```powershell
+uv sync --locked --group notebook
+```
+
+在 VS Code 等支持 Jupyter 的编辑器中选择项目 `.venv` 的 Python 作为 Notebook 内核。后续同步环境时仍需带上 `--group notebook` 以保留这组依赖；相关工具依赖通过 `uv add --group notebook <包名>` 维护。
 
 默认输入：
 
@@ -20,10 +33,10 @@ python .\scripts\validate_dataset.py
 - `data/reports/raw/validation_report.json`：总体状态、扫描完整性、输入文件 SHA-256、配置、统计和规则版本。
 - `data/reports/raw/validation_issues.jsonl`：每行一个问题组，包含全部关联记录的原文、标签、定位信息、逐方面标签冲突和待复核字段。
 
-脚本默认路径相对于项目定位，从其他目录运行也能找到默认输入。可以显式指定路径：
+脚本默认路径相对于项目定位，从其他目录运行也能找到默认输入。通过 uv 从其他目录运行时，需使用 `uv run --project <项目目录>` 并传入脚本的实际路径。以下命令均在项目根目录执行，也可以显式指定数据路径：
 
 ```powershell
-python .\scripts\validate_dataset.py --input-dir .\data\raw --output-dir .\data\reports\raw
+uv run python .\scripts\validate_dataset.py --input-dir .\data\raw --output-dir .\data\reports\raw
 ```
 
 `--train-csv`、`--validation-csv` 可以分别覆盖两个文件路径。报告目录必须位于所有输入文件所在目录之外。重复运行只替换上述两份生成报告，不触碰其他文件。
@@ -115,7 +128,7 @@ validate_label_config(saved_config)
 默认统计文本长度（原始 Unicode 字符数）和各方面的标签分布，不对长度或类别占比设置主观阈值。缺失类别属于客观 WARN。可以显式开启阈值：
 
 ```powershell
-python .\scripts\validate_dataset.py --max-text-chars 4000 --min-class-fraction 0.01
+uv run python .\scripts\validate_dataset.py --max-text-chars 4000 --min-class-fraction 0.01
 ```
 
 以上数值仅为调用示例，不代表本项目的推荐标准。长度分位数使用 nearest-rank；类别占比的分母为该集合、该方面的有效标签数量。零占比由“缺失类别”规则处理，不再重复触发占比规则。
@@ -138,7 +151,7 @@ python .\scripts\validate_dataset.py --max-text-chars 4000 --min-class-fraction 
 后续生成处理后的 CSV 时，可以复用相同的结构、文本、ID 和重复检查，仅切换合法标签范围：
 
 ```powershell
-python .\scripts\validate_dataset.py --stage mapped --input-dir .\data\processed --output-dir .\data\reports\mapped
+uv run python .\scripts\validate_dataset.py --stage mapped --input-dir .\data\processed --output-dir .\data\reports\mapped
 ```
 
 `mapped` 模式允许 `0、1、2、3`，对应约定映射 `-2→0、-1→1、0→2、1→3`。输入文件名默认与原始文件相同，也可用两个 CSV 路径参数覆盖。
@@ -148,7 +161,7 @@ python .\scripts\validate_dataset.py --stage mapped --input-dir .\data\processed
 ## 测试
 
 ```powershell
-python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v
 ```
 
 测试使用临时 CSV，不依赖大数据集，覆盖正常 CSV、多行文本、结构和标签错误、扫描中断、ID 作用域、归一化重叠及逐方面冲突、阈值告警和原始数据写保护。
@@ -164,7 +177,7 @@ python -m unittest discover -s tests -v
 如需将复算结果另存到新目录：
 
 ```powershell
-python .\scripts\review_dataset_issues.py --output-dir .\data\reports\raw_review_rerun
+uv run python .\scripts\review_dataset_issues.py --output-dir .\data\reports\raw_review_rerun
 ```
 
 脚本拒绝覆盖已有复核决定。预演仅检查候选记录的条数、空文本、已定义的重复及异常字符规则、标签分布，不替代后续实际落地后的再次校验，也不宣称完成全量语义去重或标签重标。
@@ -172,7 +185,7 @@ python .\scripts\review_dataset_issues.py --output-dir .\data\reports\raw_review
 ## 落实已复核的处理方案
 
 ```powershell
-python .\scripts\process_dataset.py
+uv run python .\scripts\process_dataset.py
 ```
 
 该步骤先核对原始文件、原始校验报告、异常明细、复核决定和复核汇总的 SHA-256，再执行明确记录的隔离或控制字符删除。当前批次的结果：
@@ -196,7 +209,7 @@ python .\scripts\process_dataset.py
 若要单独重复校验现有处理结果，使用另一个报告目录，以保留此次处理凭据中的产物摘要：
 
 ```powershell
-python .\scripts\validate_dataset.py --stage raw --input-dir .\data\processed --output-dir .\data\reports\processed_recheck
+uv run python .\scripts\validate_dataset.py --stage raw --input-dir .\data\processed --output-dir .\data\reports\processed_recheck
 ```
 
 ## 清洗后独立复核（2026-11-03）
@@ -235,7 +248,7 @@ python .\scripts\validate_dataset.py --stage raw --input-dir .\data\processed --
 后续可复算到新目录，拒绝覆盖已经存在的复核产物：
 
 ```powershell
-python .\scripts\audit_processed_dataset.py --output-dir .\data\reports\processed_review_rerun
+uv run python .\scripts\audit_processed_dataset.py --output-dir .\data\reports\processed_review_rerun
 ```
 
 自动化部分复算所有记录差异与来源；语义意见仍需结合原文阅读，不能从脚本通过推导出全部标签正确。
@@ -267,7 +280,7 @@ python .\scripts\audit_processed_dataset.py --output-dir .\data\reports\processe
 四个命令都支持 `--root`，默认使用脚本所在项目的根目录，例如只读复核数据副本：
 
 ```powershell
-python .\scripts\audit_processed_dataset.py --root D:\dataset_copy --output-dir D:\dataset_copy\data\reports\processed_review_rerun
+uv run python .\scripts\audit_processed_dataset.py --root D:\dataset_copy --output-dir D:\dataset_copy\data\reports\processed_review_rerun
 ```
 
 原始数据、既有决定、清洗结果和验证集标签均作为历史版本保留。
