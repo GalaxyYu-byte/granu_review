@@ -337,6 +337,16 @@ class AuditProcessedDatasetTests(unittest.TestCase):
         # 失败时不能发布代表审计已完成的来源总报告。
         self.assertFalse((fixture.root / "data/reports/processed_review/lineage_audit.json").exists())
 
+    def test_handwritten_empty_or_unmatched_review_evidence_is_rejected(self):
+        original = json.loads(json.dumps(self.fixture.decisions))
+        for field, value in (("reason", ""), ("reason", " \n\t"), ("evidence_quotes", []),
+                             ("evidence_quotes", [""]), ("evidence_quotes", ["原文中不存在的引文"])):
+            with self.subTest(field=field, value=value):
+                self.fixture.decisions = json.loads(json.dumps(original))
+                self.fixture.decisions[0][field] = value
+                self.refresh_review_chain()
+                with self.assertRaisesRegex(ValueError, "复核理由|证据引文"):
+                    audit_processed_dataset(self.root)
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,10 +24,12 @@ import unicodedata
 try:
     from .dataset_io import read_jsonl, receipt_origin, receipt_path, resolve_receipt_path
     from .label_config import ASPECT_COLUMNS, EXPECTED_COLUMNS, parse_label
+    from .review_evidence import validate_review_evidence
     from .validate_dataset import file_sha256, validate_dataset, _write_json_atomic
 except ImportError:
     from dataset_io import read_jsonl, receipt_origin, receipt_path, resolve_receipt_path
     from label_config import ASPECT_COLUMNS, EXPECTED_COLUMNS, parse_label
+    from review_evidence import validate_review_evidence
     from validate_dataset import file_sha256, validate_dataset, _write_json_atomic
 
 
@@ -160,6 +162,8 @@ def process_dataset(report_path: Path, decisions_path: Path, review_summary_path
     expected_records = {}
     for decision in decisions:
         issue = issues_by_id[decision["issue_id"]]
+        # 处理阶段同样校验理由和精确引文，防止手工编辑决定后绕过复核入口。
+        validate_review_evidence(decision, issue["records"])
         if (decision["source_sha256"] != issue["source_sha256"]
                 or issue["stage"] != "raw" or issue["rules_version"] != report["rules_version"]
                 or issue["source_sha256"] != {split: report["files"][split]["sha256"]

@@ -78,6 +78,8 @@ class ProcessDatasetTests(unittest.TestCase):
                 "action_applied": False,
                 "label_changes": [],
                 "status": "reviewed_pending_application",
+                "reason": "已核对该问题的完整原文和标签，按明确的隔离或控制字符删除方案执行。",
+                "evidence_quotes": [issue["records"][0]["text"]],
             }
             if issue["severity"] == "REVIEW":
                 train = [ref for ref in references if ref["split"] == "train"]
@@ -236,6 +238,22 @@ class ProcessDatasetTests(unittest.TestCase):
                     self.process()
                 for path in (self.processed_dir, self.quarantine_dir, self.processed_reports):
                     self.assertFalse(path.exists())
+        self.assert_raw_unchanged()
+
+    def test_empty_evidence_is_rejected_even_after_refreshing_decision_digest(self):
+        """手改决定并同步刷新摘要，也不能把空理由或空引文变成有效复核授权。"""
+        decision = self.decisions[0]
+        original = {field: decision[field] for field in ("reason", "evidence_quotes")}
+        for field, value in (("reason", ""), ("reason", " \n\t"), ("reason", None),
+                             ("evidence_quotes", [""]), ("evidence_quotes", [" \t"]),
+                             ("evidence_quotes", [None]), ("evidence_quotes", "任意字符串")):
+            with self.subTest(field=field, value=value):
+                decision.update(original)
+                decision[field] = value
+                self.save_decisions_and_summary()
+                with self.assertRaises(ValueError):
+                    self.process()
+                self.assertFalse(self.processed_dir.exists())
         self.assert_raw_unchanged()
 
     def test_each_decision_must_have_reviewed_unapplied_status(self):

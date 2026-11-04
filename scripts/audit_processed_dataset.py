@@ -20,10 +20,12 @@ import unicodedata
 try:
     from .dataset_io import read_jsonl, receipt_origin, receipt_path, resolve_receipt_path
     from .label_config import ASPECT_COLUMNS, EXPECTED_COLUMNS
+    from .review_evidence import validate_review_evidence
     from .validate_dataset import file_sha256, validate_dataset, _write_json_atomic
 except ImportError:
     from dataset_io import read_jsonl, receipt_origin, receipt_path, resolve_receipt_path
     from label_config import ASPECT_COLUMNS, EXPECTED_COLUMNS
+    from review_evidence import validate_review_evidence
     from validate_dataset import file_sha256, validate_dataset, _write_json_atomic
 
 
@@ -233,6 +235,7 @@ def audit_processed_dataset(root: Path = PROJECT_ROOT) -> tuple[dict, list[dict]
         _check(decision["source_sha256"] == issue["source_sha256"]
                and decision["rule_id"] == issue["rule_id"]
                and decision["original_severity"] == issue["severity"], "决定的来源或规则与原始问题不一致。")
+        validate_review_evidence(decision, issue["records"])
         for record in issue["records"]:
             key = record["split"], record["record_number"]
             _check(key not in expected_records or expected_records[key] == record, "同一原始记录的证据不一致。")

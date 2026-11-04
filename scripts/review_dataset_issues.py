@@ -22,10 +22,12 @@ import unicodedata
 try:
     from .dataset_io import read_jsonl, receipt_origin, receipt_path, resolve_receipt_path
     from .label_config import ASPECT_COLUMNS, CLASS_VALUES, EXPECTED_COLUMNS, parse_label
+    from .review_evidence import validate_review_evidence
     from .validate_dataset import file_sha256, normalize_for_comparison, _write_json_atomic
 except ImportError:
     from dataset_io import read_jsonl, receipt_origin, receipt_path, resolve_receipt_path
     from label_config import ASPECT_COLUMNS, CLASS_VALUES, EXPECTED_COLUMNS, parse_label
+    from review_evidence import validate_review_evidence
     from validate_dataset import file_sha256, normalize_for_comparison, _write_json_atomic
 
 
@@ -126,11 +128,9 @@ def build_review(report_path: Path = DEFAULT_REPORT, *, root: Path = PROJECT_ROO
             if key in expected_records and expected_records[key] != record:
                 raise ValueError("同一原始记录在不同问题中的证据不一致。")
             expected_records[key] = record
-        # 引文必须确实出现在本问题原文中；有复核理由但缺乏可定位证据时同样拒绝复用。
-        if not note["evidence_quotes"] or any(
-            not any(quote in record["text"] for record in records) for quote in note["evidence_quotes"]
-        ):
-            raise ValueError(f"{issue['issue_id']} 的证据引文不在原始文本中。")
+        # 理由和每段引文都必须有实际内容，且引文必须原样出现在本问题原文中。
+        # 与处理、审计阶段共用校验，防止空字符串的子串匹配特性或手改决定绕过证据要求。
+        validate_review_evidence(note, records)
         decision = {
             "schema_version": "1.0", "review_method_version": "1.0.0",
             "issue_id": issue["issue_id"], "rule_id": issue["rule_id"],

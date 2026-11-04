@@ -12,6 +12,7 @@ import unittest
 from scripts.dataset_io import read_jsonl, resolve_receipt_path
 from scripts.label_config import ASPECT_COLUMNS, EXPECTED_COLUMNS
 from scripts.review_dataset_issues import NOTE_NAMES, build_review, main
+from scripts.review_evidence import validate_review_evidence
 from scripts.validate_dataset import validate_dataset
 
 
@@ -132,6 +133,68 @@ class ReviewDatasetIssuesTests(unittest.TestCase):
         self.assertEqual(decisions, [])
         self.assertEqual(summary["known_validation_label_disputes"], [])
         self.assertTrue(any("0 retained validation records" in line for line in summary["limitations"]))
+
+    def test_review_rejects_missing_empty_whitespace_or_wrong_type_reasons(self):
+        """有原文引文也不能批准空理由；非字符串理由不通过隐式转换获得有效性。"""
+        self.rows["train"].extend([self.row("a", "价格  合理", 1), self.row("b", "价格 合理", 1)])
+        self.review()
+        notes_path = self.reports / NOTE_NAMES[0]
+        original_notes = json.loads(notes_path.read_text(encoding="utf-8"))
+        for value in (None, "", " \t\r\n\u2028", 0, False, [], {}, ["理由"]):
+            with self.subTest(reason=value):
+                notes = json.loads(json.dumps(original_notes))
+                notes[0]["reason"] = value
+                notes_path.write_text(json.dumps(notes, ensure_ascii=False), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "复核理由"):
+                    build_review(self.reports / "validation_report.json", root=self.root)
+        notes = json.loads(json.dumps(original_notes))
+        del notes[0]["reason"]
+        notes_path.write_text(json.dumps(notes, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "复核理由"):
+            build_review(self.reports / "validation_report.json", root=self.root)
+
+    def test_review_rejects_invalid_or_unmatched_quote_collections_and_members(self):
+        """拒绝空集合、空白引文、错误类型及不在原文中的引文，并逐项检查混合列表。"""
+        self.rows["train"].extend([self.row("a", "价格  合理", 1), self.row("b", "价格 合理", 1)])
+        self.review()
+        notes_path = self.reports / NOTE_NAMES[0]
+        original_notes = json.loads(notes_path.read_text(encoding="utf-8"))
+        cases = ([], [""], [" \t\r\n\u2028"], [None], [42], [True], ["价格", ""],
+                 ["价格", 42], None, "价格", {}, {"quote": "价格"}, ["原文中不存在的引文"], [" 价格"])
+        for value in cases:
+            with self.subTest(evidence_quotes=value):
+                notes = json.loads(json.dumps(original_notes))
+                notes[0]["evidence_quotes"] = value
+                notes_path.write_text(json.dumps(notes, ensure_ascii=False), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "证据引文"):
+                    build_review(self.reports / "validation_report.json", root=self.root)
+        notes = json.loads(json.dumps(original_notes))
+        del notes[0]["evidence_quotes"]
+        notes_path.write_text(json.dumps(notes, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "证据引文"):
+            build_review(self.reports / "validation_report.json", root=self.root)
+
+    def test_valid_reason_and_exact_quote_keep_their_original_whitespace(self):
+        """有效理由和引文原样写入决定，去空白仅用于非空判断，不能改变匹配或保存内容。"""
+        self.rows["train"].extend([self.row("a", "价格  合理", 1), self.row("b", "价格 合理", 1)])
+        self.review()
+        notes_path = self.reports / NOTE_NAMES[0]
+        notes = json.loads(notes_path.read_text(encoding="utf-8"))
+        notes[0]["reason"] = "  已核对原文和标签。\n"
+        notes[0]["evidence_quotes"] = ["价格  ", "价格 合理"]
+        notes_path.write_text(json.dumps(notes, ensure_ascii=False), encoding="utf-8")
+        decisions, _ = build_review(self.reports / "validation_report.json", root=self.root)
+        self.assertEqual(decisions[0]["reason"], notes[0]["reason"])
+        self.assertEqual(decisions[0]["evidence_quotes"], notes[0]["evidence_quotes"])
+
+    def test_evidence_helper_requires_a_list_and_matches_original_unicode_text(self):
+        """公共校验同样拒绝元组形式，且精确保留引文中的特殊分隔符及前后空白。"""
+        records = [{"text": "价格\u2028\u2029 合理"}]
+        item = {"reason": "  已逐字核对。 ", "evidence_quotes": ["\u2028\u2029 合理"]}
+        self.assertIsNone(validate_review_evidence(item, records))
+        self.assertEqual(item["evidence_quotes"], ["\u2028\u2029 合理"])
+        with self.assertRaisesRegex(ValueError, "证据引文"):
+            validate_review_evidence({**item, "evidence_quotes": ("合理",)}, records)
 
     def test_relative_report_paths_can_be_reviewed_after_copying_project(self):
         """复制原始数据及报告后，相对路径应基于新根目录重算出相同的决定和数量预演。"""
