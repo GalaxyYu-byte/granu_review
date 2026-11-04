@@ -110,6 +110,47 @@ validate_label_config(saved_config)
 
 配置包含 `aspect_columns` 和 `class_values`；`class_values[i]` 表示模型类别编号 `i` 对应的原始标签。缺少配置、方面顺序或类别顺序不一致、类别类型不合法时，加载检查抛出 `ValueError`，避免仅凭输出维度相同就继续评估。配置返回独立副本，可直接进行 JSON 保存读取。当前仓库尚无模型训练与评估脚本，这些接口供后续脚本共用。
 
+## 读取清洗后的训练和验证数据
+
+`scripts/dataset_reader.py` 使用标准库读取已经发布的清洗批次。正式训练使用 `load_datasets()`，以处理报告绑定训练集、验证集和二次校验报告：
+
+```python
+from scripts.dataset_reader import load_datasets
+
+bundle = load_datasets("data/reports/processed/processing_report.json")
+print(len(bundle.train), len(bundle.validation))
+sample = bundle.train[0]
+print(sample.sample_id, sample.text, sample.labels)
+```
+
+`bundle.train` 和 `bundle.validation` 是可重复访问的样本列表，保持 CSV 顺序。每条 `ReviewSample` 包含 `split`、字符串 `sample_id`、原始 `text`、长度为 20 的 `labels` 元组，以及 `processed_record_number` 和 `physical_line_end`。前者是当前清洗后 CSV 不含表头、从 1 开始的数据记录序号，后者是该记录在同一文件中的物理结束行号；它们不能用于推算原始 CSV 的记录位置。样本按 `(split, sample_id)` 定位，ID 可以不连续。
+
+输入标签必须仍为原始的 `-2、-1、0、1`。读取器共用 `encode_labels()`，仅在内存中映射一次，得到类别编号 `0、1、2、3`，方面顺序由 `ASPECT_COLUMNS` 确定；类别 `0` 表示“未提及”，也是训练类别。`bundle.label_config` 保存独立的标签配置副本；`bundle.sources` 按 `processing_report`、`validation_report`、`train`、`validation` 保存本次实际读取文件的绝对 `path` 和 `sha256`，可随训练结果保存。
+
+`load_datasets()` 要求处理报告为 `stage="cleaned_original_label_space"`、`mapping_applied=false`，拒绝已经映射的批次。二次校验必须扫描完整、`validation_gate_passed=true`，最终状态为 `passed` 或 `passed_with_warnings`。已复核放行的问题可以继续保留在 REVIEW 扫描计数中，不以 REVIEW 数量为零作为加载条件。读取器还核对报告与 CSV 的路径、摘要和记录数，完整读完并确认输入未变化后才返回数据；指定批次失败时直接报错，不回退其他批次。
+
+路径相对于 `root` 解析，默认 `root` 为脚本所在项目根目录。现有绝对路径凭据和新相对路径凭据均支持随项目副本迁移。完整来源审计仍通过 `audit_processed_dataset.py` 单独执行，读取器只核对本次加载所需的文件和报告绑定。
+
+只读验证默认批次，可执行以下任一命令，终端输出样本数量、标签形状、类别范围和来源摘要的 JSON 汇总，不生成或改写数据文件：
+
+```powershell
+uv run python .\scripts\dataset_reader.py
+uv run python -m scripts.dataset_reader
+```
+
+选择其他清洗批次或项目副本：
+
+```powershell
+uv run python .\scripts\dataset_reader.py --processing-report .\data\reports\processed_v2\processing_report.json
+uv run python .\scripts\dataset_reader.py --root D:\dataset_copy
+```
+
+需要独立读取一份明确使用原始标签的 CSV 时，可以调用 `read_split(path, split="train")` 或 `read_split(path, split="validation")`。可选的 `expected_sha256` 绑定预期文件摘要；`load_datasets()` 会自动传入处理凭据的摘要，并核对实际送入 CSV 解析器的字节。该入口不核验处理报告；仅凭 CSV 中的数值无法始终判断它是否已经映射，因此正式训练应使用 `load_datasets()`。
+
+两个入口均严格处理表头、列宽、ID、空白文本、UTF-8/CSV 解析和标签错误，失败时提供记录定位信息。读取保留原文、ID 和顺序，不自动跳过坏记录；分词、截断、padding、张量转换和训练打乱由后续模型适配层负责。
+
+本批真实数据读取验证（2026-11-04）：训练集 104,969 条、验证集 15,000 条，标签形状分别为 `[104969, 20]`、`[15000, 20]`，编码范围为 `0～3`。另行按 CSV 逐条核对全部 119,969 条记录的 ID、顺序、原文和位置，并反解比较全部 2,399,380 个标签；20 个方面的分布均与二次校验报告一致。验证样本 `13036`、`14365` 保留原标签。验证脚本和结果保存于本地 `data/reports/dataset_reader/verify_reading.py`、`reading_verification.json`，既有数据与报告的摘要均未改变。
+
 ## 文本比较与冲突
 
 两层检测：
