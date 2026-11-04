@@ -18,13 +18,12 @@ import math
 from pathlib import Path
 import re
 import sys
-import tempfile
 import unicodedata
 
 try:
-    from .dataset_io import receipt_path
+    from .dataset_io import file_sha256, receipt_path, write_json_atomic as _write_json_atomic
 except ImportError:
-    from dataset_io import receipt_path
+    from dataset_io import file_sha256, receipt_path, write_json_atomic as _write_json_atomic
 
 
 try:
@@ -49,15 +48,6 @@ WHITESPACE_PATTERN = re.compile(r"\s+")
 def normalize_for_comparison(text: str) -> str:
     """仅生成比较用的归一化键，不改变原文，连续空白仍保留一个分词边界。"""
     return WHITESPACE_PATTERN.sub(" ", unicodedata.normalize("NFC", text)).strip()
-
-
-def file_sha256(path: Path) -> str:
-    """分块计算文件摘要，避免将整份数据一次读入内存。"""
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 @dataclass(slots=True)
@@ -381,29 +371,6 @@ def _check_groups(records: list[Record], collector: IssueCollector, id_scope: st
     summary["unique_records_in_duplicate_groups"] = len(affected_records)
     summary["unique_records_in_cross_split_groups"] = len(cross_split_records)
     return summary
-
-
-def _write_json_atomic(path: Path, value, *, jsonl: bool = False):
-    """先在目标目录写临时文件，再原子替换，避免读者看到半份报告。
-
-    每个 JSONL 对象只追加一个真正的换行；字符串内部字符由 JSON 编码器
-    处理。调用方负责判断目标是否允许覆盖，本函数仅保证单文件发布完整。
-    """
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", suffix=".tmp",
-                                         prefix=path.stem + "_", dir=path.parent, delete=False) as stream:
-            temporary = Path(stream.name)
-            if jsonl:
-                for item in value:
-                    stream.write(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n")
-            else:
-                json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
-                stream.write("\n")
-        temporary.replace(path)
-    finally:
-        if temporary is not None and temporary.exists():
-            temporary.unlink()
 
 
 def validate_dataset(split_paths: dict[str, Path], output_dir: Path, *, stage: str = "raw",

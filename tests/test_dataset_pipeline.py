@@ -16,6 +16,7 @@ from scripts.dataset_io import read_jsonl, receipt_path, resolve_receipt_path
 from scripts.label_config import ASPECT_COLUMNS, EXPECTED_COLUMNS
 from scripts.process_dataset import process_dataset
 from scripts.review_dataset_issues import NOTE_NAMES, build_review
+from scripts.review_validation import match_review_approvals, validation_options
 from scripts.validate_dataset import file_sha256, validate_dataset
 
 
@@ -36,7 +37,7 @@ class DatasetPipelineTests(unittest.TestCase):
         return {"id": sample_id, "content": text,
                 **{aspect: str(label) for aspect in ASPECT_COLUMNS}}
 
-    def prepare_review(self):
+    def prepare_review(self, **validation_kwargs):
         """生成完整的临时原始报告、证据注释和复核快照，不跳过阶段之间的摘要绑定。"""
         raw_dir = self.root / "data/raw"
         raw_dir.mkdir(parents=True)
@@ -47,7 +48,7 @@ class DatasetPipelineTests(unittest.TestCase):
                 writer = csv.DictWriter(stream, fieldnames=EXPECTED_COLUMNS)
                 writer.writeheader()
                 writer.writerows(self.rows[split])
-        report = validate_dataset(paths, raw_reports, root=self.root)
+        report = validate_dataset(paths, raw_reports, root=self.root, **validation_kwargs)
         issues = read_jsonl(resolve_receipt_path(report["artifacts"]["issues"], root=self.root))
         notes = []
         for issue in issues:
@@ -99,7 +100,7 @@ class DatasetPipelineTests(unittest.TestCase):
         with path.open(encoding="utf-8", newline="") as stream:
             return list(csv.DictReader(stream))
 
-    def assert_review_resolutions(self, processing, decisions, root=None):
+    def assert_review_resolutions(self, processing, decisions, root=None, expected_source_ids=None):
         """扫描发现仍保留为事实，每项放行都必须完整关联已复核的保留决定。
 
         因已知重复而继续保留的记录不应再次阻塞发布，但也不能通过清零
@@ -112,6 +113,8 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual({item["issue_id"] for item in resolutions}, review_ids)
         self.assertEqual(len(resolutions), len(review_ids))
         allowed = {item["issue_id"] for item in decisions if item["action"]["type"] == "retain_reviewed_records"}
+        if expected_source_ids is not None:
+            allowed = set(expected_source_ids)
         self.assertEqual({issue_id for item in resolutions for issue_id in item["source_issue_ids"]}, allowed)
         self.assertEqual(post["status"], "passed_with_warnings")
         self.assertEqual(post["scan_status"], "needs_review")
@@ -129,6 +132,17 @@ class DatasetPipelineTests(unittest.TestCase):
         self.assertEqual(edits, [])
         self.assertEqual(disputes, [])
         self.assert_review_resolutions(processing, decisions)
+
+    def test_clean_batch_with_identical_empty_issues_and_decisions_can_be_audited(self):
+        """无问题批次的两份 JSONL 都为空且摘要相同，仍须按来源角色准确绑定而非误判歧义。"""
+        decisions, summary = self.prepare_review()
+        self.assertEqual(decisions, [])
+        self.assertEqual(summary["quarantine_count"], 0)
+        processing, report, edits, disputes = self.process_and_audit()
+        self.assertEqual(processing["record_outcomes"], [])
+        self.assertTrue(report["mechanical_checks_passed"])
+        self.assertEqual(edits, [])
+        self.assertEqual(disputes, [])
 
     def test_unicode_jsonl_separators_survive_full_pipeline_and_only_reviewed_control_is_removed(self):
         """同一记录可以同时涉及重复和字符告警；只删除已批准控制符，保留其他分隔字符。"""
@@ -192,6 +206,146 @@ class DatasetPipelineTests(unittest.TestCase):
                 path = resolve_receipt_path(value, root=copied_root)
                 self.assertTrue(path.is_relative_to(copied_root))
                 self.assertTrue(path.is_file())
+
+    def test_cross_split_groups_project_to_all_remaining_validation_members(self):
+        """训练侧隔离后原组可变为验证集内部重复；同标和冲突都必须保留完整验证成员。"""
+        parent = self.root
+        baseline = self.rows
+        for comparison in ("exact", "normalized"):
+            for conflicting in (False, True):
+                with self.subTest(comparison=comparison, conflicting=conflicting):
+                    self.root = parent / f"{comparison}-{conflicting}"
+                    self.rows = {split: [row.copy() for row in records] for split, records in baseline.items()}
+                    texts = (["价格 合理"] * 3 if comparison == "exact"
+                             else ["价格  合理", "价格 合理", "价格   合理"])
+                    self.rows["train"].append(self.row("overlap-train", texts[0], 1))
+                    self.rows["validation"].extend([
+                        self.row("validation-a", texts[1], 1),
+                        self.row("validation-b", texts[2], -1 if conflicting else 1),
+                    ])
+                    decisions, _ = self.prepare_review()
+                    processing, audit, _, disputes = self.process_and_audit()
+                    self.assertEqual(processing["quarantine_count"], 1)
+                    self.assertEqual(self.artifact_rows(processing, "validation"), self.rows["validation"])
+                    self.assertEqual(audit["changed_label_cells"], 0)
+                    self.assertEqual({item["id"] for item in disputes},
+                                     {"validation-a", "validation-b"} if conflicting else set())
+                    post = self.artifact_json(processing, "validation_report")
+                    if comparison == "normalized" or conflicting:
+                        approved_ids = {item["issue_id"] for item in decisions
+                                        if item["action"]["type"] == "quarantine_training_overlap"}
+                        self.assert_review_resolutions(processing, decisions, expected_source_ids=approved_ids)
+                        findings = read_jsonl(resolve_receipt_path(post["artifacts"]["issues"], root=self.root))
+                        self.assertTrue(any(item["rule_id"] == f"within_split_{comparison}_duplicate"
+                                            for item in findings))
+                    else:
+                        self.assertEqual(post["issue_counts"]["REVIEW"], 0)
+
+    def test_normalized_parent_can_project_to_an_exact_validation_group(self):
+        """移除唯一排版变体后，归一化父组可以退化为完全重复，两个原授权都须正确关联。"""
+        self.rows["train"].append(self.row("overlap-train", "价格  合理", 1))
+        self.rows["validation"].extend([
+            self.row("validation-a", "价格 合理", 1), self.row("validation-b", "价格 合理", -1),
+        ])
+        decisions, _ = self.prepare_review()
+        processing, _, _, _ = self.process_and_audit()
+        approved_ids = {item["issue_id"] for item in decisions}
+        self.assert_review_resolutions(processing, decisions, expected_source_ids=approved_ids)
+        post = self.artifact_json(processing, "validation_report")
+        findings = read_jsonl(resolve_receipt_path(post["artifacts"]["issues"], root=self.root))
+        review = next(item for item in findings if item["severity"] == "REVIEW")
+        self.assertEqual(review["rule_id"], "within_split_exact_duplicate")
+
+    def test_class_fraction_threshold_is_inherited_after_training_isolation(self):
+        """原始分布均超过二成；移出重复训练成员后，原阈值必须继续发现低占比类别。"""
+        self.rows["train"].extend([
+            self.row("extra-negative-two", "独立补充评论甲", -2),
+            self.row("extra-negative-one", "独立补充评论乙", -1),
+            self.row("extra-zero", "独立补充评论丙", 0),
+            self.row("overlap-a", "价格  合理", 1), self.row("overlap-b", "价格 合理", 1),
+        ])
+        self.rows["validation"].append(self.row("overlap-validation", "价格   合理", 1))
+        self.prepare_review(min_class_fraction=0.2)
+        processing, audit, _, _ = self.process_and_audit()
+        post = self.artifact_json(processing, "validation_report")
+        self.assertEqual(validation_options(post),
+                         {"id_scope": "split", "max_text_chars": None, "min_class_fraction": 0.2})
+        findings = read_jsonl(resolve_receipt_path(post["artifacts"]["issues"], root=self.root))
+        fractions = [item for item in findings if item["rule_id"] == "class_fraction"]
+        self.assertEqual(len(fractions), len(ASPECT_COLUMNS))
+        self.assertTrue(all(item["threshold"] == 0.2 and item["split"] == "train" for item in fractions))
+        self.assertEqual(post["status"], "passed_with_warnings")
+        self.assertEqual(audit["retained_counts"], {"train": 7, "validation": 5})
+
+    def test_new_conflicting_duplicate_created_by_cleaning_is_not_preapproved(self):
+        """字符清洗批准只授权改该条正文；由此新产生的冲突组不能冒用字符告警获得保留。"""
+        self.rows["train"].extend([
+            self.row("to-clean", "价格\x14合理", 1), self.row("unchanged", "价格合理", -1),
+        ])
+        decisions, _ = self.prepare_review()
+        self.assertEqual({item["action"]["type"] for item in decisions}, {"remove_reviewed_control_characters"})
+        raw_reports = self.root / "data/reports/raw"
+        before = {path: path.read_bytes() for path in (self.root / "data/raw").iterdir()}
+        with self.assertRaisesRegex(ValueError, "REVIEW"):
+            process_dataset(raw_reports / "validation_report.json", raw_reports / "review_decisions.jsonl",
+                            raw_reports / "review_summary.json", self.root / "data/processed",
+                            self.root / "data/quarantine", self.root / "data/reports/processed", root=self.root)
+        self.assertFalse((self.root / "data/reports/processed/processing_report.json").exists())
+        self.assertFalse((self.root / "data/processed" / FILENAMES["train"]).exists())
+        for path, expected in before.items():
+            self.assertEqual(path.read_bytes(), expected)
+
+    def test_approval_matching_rejects_unrelated_members_and_partial_source_groups(self):
+        """逐条成员曾经获批不等于任何子组都获批，原组必须经过完整投影后整体相同。"""
+        self.rows["train"].extend([
+            self.row("a", "价格 合理", 1), self.row("b", "价格  合理", 1),
+            self.row("c", "价格   合理", 1),
+        ])
+        decisions, _ = self.prepare_review()
+        sources = read_jsonl(self.root / "data/reports/raw/validation_issues.jsonl")
+        source = next(item for item in sources if item["rule_id"] == "within_split_normalized_duplicate")
+        self.assertEqual(match_review_approvals(source, sources, decisions, set(), {}), [source["issue_id"]])
+        subset = {**source, "records": source["records"][:2]}
+        self.assertEqual(match_review_approvals(subset, sources, decisions, set(), {}), [])
+        unrelated = {**source, "records": [{**record, "id": "unrelated"} if index == 0 else record
+                                            for index, record in enumerate(source["records"])]}
+        self.assertEqual(match_review_approvals(unrelated, sources, decisions, set(), {}), [])
+        unknown_rule = {**source, "rule_id": "cross_split_global_id"}
+        self.assertEqual(match_review_approvals(unknown_rule, sources, decisions, set(), {}), [])
+
+    def test_retention_fully_overridden_by_overlap_is_reported_per_record(self):
+        """同标签完全重复虽批准保留，但跨集合隔离优先，日志不得再声称保留动作已应用。"""
+        self.rows["train"].extend([
+            self.row("train-a", "价格 合理", 1), self.row("train-b", "价格 合理", 1),
+        ])
+        self.rows["validation"].append(self.row("validation-a", "价格  合理", 1))
+        decisions, _ = self.prepare_review()
+        processing, _, _, _ = self.process_and_audit()
+        self.assertEqual(processing["application_log_version"], "2.0")
+        applications = read_jsonl(resolve_receipt_path(processing["outputs"]["applications"]["path"], root=self.root))
+        retained = next(item for item in applications if item["action_type"] == "retain_reviewed_records")
+        overlap_id = next(item["issue_id"] for item in decisions if item["action"]["type"] == "quarantine_training_overlap")
+        self.assertEqual(retained["application_status"], "overridden")
+        self.assertIs(retained["action_applied"], False)
+        self.assertEqual(len(retained["record_results"]), 2)
+        for result in retained["record_results"]:
+            self.assertEqual(result["disposition"], "quarantined")
+            self.assertIs(result["text_modified"], False)
+            self.assertIs(result["decision_applied"], False)
+            self.assertEqual(result["overridden_by_issue_ids"], [overlap_id])
+
+    def test_validation_options_reject_malformed_inherited_configuration(self):
+        """错误配置必须显式失败，不能因后处理重新校验而被静默替换成宽松默认值。"""
+        cases = [
+            {"id_scope": "unknown"}, {"id_scope": []}, {"max_text_chars": True},
+            {"max_text_chars": 0}, {"min_class_fraction": "0.2"},
+            {"min_class_fraction": True}, {"min_class_fraction": 1},
+            {"min_class_fraction": float("nan")},
+        ]
+        for configuration in cases:
+            with self.subTest(configuration=configuration):
+                with self.assertRaises(ValueError):
+                    validation_options({"configuration": configuration})
 
 
 if __name__ == "__main__":

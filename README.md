@@ -293,3 +293,36 @@ uv run python .\scripts\audit_processed_dataset.py --root D:\dataset_copy --outp
 复核生成、处理执行和独立审计都会检查这些条件。有效引文不做空格归一化，
 避免把并非来自原文的内容当成证据。检查只证明最低证据格式及来源有效，
 不能代替对理由是否充分的人工判断。
+
+同一记录可能同时属于组内重复和跨集合重叠。新处理报告使用
+`application_log_version=2.0`：`record_outcomes` 记录所有问题成员最终是否保留、
+是否修改文本及实际生效的问题编号；每条应用日志的 `record_results`
+进一步说明本决定对各成员是否生效，以及被哪些问题覆盖。
+
+- `application_status=applied`：本决定对全部成员生效。
+- `application_status=partially_overridden`：只对部分成员生效。
+- `application_status=overridden`：全部成员都被其他已复核动作覆盖，`action_applied=false`。
+
+例如训练样本 A、B 的组内保留决定遇到跨集合隔离决定时，最终记录为隔离，
+原保留日志列出跨集合问题编号，不再声称 A、B 已原样保留。
+保留成员如发生另一项已批准的字符清洗，也会明确记录覆盖关系。
+历史凭据保持原样；旧日志只有在其声明与实际去向一致时才可通过审计。
+
+二次校验及审计中的新扫描继承原始报告的 `id_scope`、`max_text_chars`
+和 `min_class_fraction`。隔离后类别占比下降产生的告警会继续显示。
+跨集合重复组移出训练成员后，剩余验证成员即使变成集合内重复，
+只要完整剩余组的身份、原文和标签与原批准方案精确一致，也可承接原决定；
+无关新成员或任意新子组不能自动获得批准。
+
+### 选择其他处理批次审计
+
+当第二批数据保存到 `processed_v2` 等目录时，使用 `--processing-report`
+明确指定该批的处理完成凭据。审计只读取该凭据绑定的输入、输出和日志，
+新扫描也针对同一批次，不会回退读取默认的 `processed` 目录：
+
+```powershell
+uv run python .\scripts\audit_processed_dataset.py --processing-report .\data\reports\processed_v2\processing_report.json --output-dir .\data\reports\processed_v2_review
+```
+
+Python 调用对应为 `audit_processed_dataset(root, processing_report=report_path)`。
+不传该参数时仍审计标准目录下的原批次；每次另存审计结果到新的目录。

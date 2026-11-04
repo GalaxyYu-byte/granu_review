@@ -12,7 +12,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from scripts.process_dataset import process_dataset
+from scripts.process_dataset import _resolve_record_outcomes, process_dataset
 from scripts.dataset_io import read_jsonl
 from scripts.validate_dataset import ASPECT_COLUMNS, EXPECTED_COLUMNS, file_sha256, validate_dataset
 
@@ -255,6 +255,31 @@ class ProcessDatasetTests(unittest.TestCase):
                     self.process()
                 self.assertFalse(self.processed_dir.exists())
         self.assert_raw_unchanged()
+
+    def test_partial_retention_override_records_each_member_and_preserves_order_independence(self):
+        """保留组仅一员被清洗时，按成员记录部分覆盖，并且决定排列不影响最终结论。"""
+        first = {"split": "train", "id": "a", "record_number": 1}
+        second = {"split": "train", "id": "b", "record_number": 2}
+        decisions = [
+            {"issue_id": "keep", "action": {"type": "retain_reviewed_records"},
+             "affected_records": [first, second]},
+            {"issue_id": "clean", "action": {"type": "remove_reviewed_control_characters"},
+             "affected_records": [first]},
+        ]
+        records = {("train", 1): first, ("train", 2): second}
+        clean = {("train", 1): {"issue_id": "clean"}}
+        execution, outcomes = _resolve_record_outcomes(decisions, records, {}, clean)
+        self.assertEqual(execution["keep"]["application_status"], "partially_overridden")
+        self.assertTrue(execution["keep"]["action_applied"])
+        self.assertEqual(execution["keep"]["resolution"], "partially_superseded_by_other_reviewed_actions")
+        self.assertFalse(execution["keep"]["record_results"][0]["decision_applied"])
+        self.assertEqual(execution["keep"]["record_results"][0]["overridden_by_issue_ids"], ["clean"])
+        self.assertTrue(execution["keep"]["record_results"][1]["decision_applied"])
+        self.assertEqual(outcomes[0]["effective_issue_ids"], ["clean"])
+        self.assertEqual(outcomes[1]["effective_issue_ids"], ["keep"])
+        reordered_execution, reordered_outcomes = _resolve_record_outcomes(decisions[::-1], records, {}, clean)
+        self.assertEqual(reordered_execution, execution)
+        self.assertEqual(reordered_outcomes, outcomes)
 
     def test_each_decision_must_have_reviewed_unapplied_status(self):
         """逐项检查待复核、否决、已应用及非布尔应用状态，均应在写入前拒绝。"""

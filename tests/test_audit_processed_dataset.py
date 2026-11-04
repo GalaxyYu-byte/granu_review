@@ -85,6 +85,21 @@ class AuditProcessedDatasetTests(unittest.TestCase):
         self.refresh_input_digest(self.fixture.decisions_path)
         self.refresh_input_digest(self.fixture.summary_path)
 
+    def refresh_source_issue_chain(self):
+        """重写原始问题及所有引用摘要，模拟最外层材料都已同步更新的篡改。"""
+        issues_path = self.fixture.raw_reports / "validation_issues.jsonl"
+        issues_path.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in self.fixture.issues), encoding="utf-8")
+        report = json.loads(self.fixture.report_path.read_text(encoding="utf-8"))
+        report["artifacts"]["issues_sha256"] = file_sha256(issues_path)
+        report["rule_counts"] = {rule: sum(item["rule_id"] == rule for item in self.fixture.issues)
+                                 for rule in {item["rule_id"] for item in self.fixture.issues}}
+        self.fixture.report_path.write_text(json.dumps(report), encoding="utf-8")
+        self.fixture.summary["source_issues_sha256"] = file_sha256(issues_path)
+        self.fixture.summary["source_report_sha256"] = file_sha256(self.fixture.report_path)
+        self.refresh_input_digest(issues_path)
+        self.refresh_input_digest(self.fixture.report_path)
+        self.refresh_review_chain()
+
     def test_real_processing_result_passes_without_writing_any_inputs(self):
         # 保存全部输入与产物字节，证明审计成功也不会顺便改写被审计材料。
         before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
@@ -246,6 +261,9 @@ class AuditProcessedDatasetTests(unittest.TestCase):
         for artifact in self.processing["outputs"].values():
             path = resolve_receipt_path(artifact["path"], root=self.root)
             artifact.update(path=str(path), sha256=file_sha256(path))
+        if "input_roles" in self.processing:
+            self.processing["input_roles"] = {name: str(resolve_receipt_path(value, root=self.root))
+                                               for name, value in self.processing["input_roles"].items()}
         self.processing_path.write_text(json.dumps(self.processing), encoding="utf-8")
         self.assert_copied_project_passes()
 
@@ -337,6 +355,61 @@ class AuditProcessedDatasetTests(unittest.TestCase):
         # 失败时不能发布代表审计已完成的来源总报告。
         self.assertFalse((fixture.root / "data/reports/processed_review/lineage_audit.json").exists())
 
+    def alternative_batch(self):
+        """在同一临时项目中创建第二批产物，输入仍由其自身处理凭据完整绑定。"""
+        reports = self.root / "data/reports/candidate"
+        result = self.fixture.process(output_dir=self.root / "data/candidate",
+                                      quarantine_dir=self.root / "data/candidate_quarantine",
+                                      reports_dir=reports)
+        return reports / "processing_report.json", result
+
+    def test_selected_batch_is_audited_without_reading_default_outputs(self):
+        selected, processing = self.alternative_batch()
+        # 默认批次仍然存在但已经损坏；显式选择的新批次必须完全独立核验。
+        default_train = resolve_receipt_path(self.processing["outputs"]["train"]["path"], root=self.root)
+        default_train.write_bytes(b"default batch is unusable")
+        report, _, _ = audit_processed_dataset(self.root, processing_report=selected)
+        self.assertTrue(report["mechanical_checks_passed"])
+        self.assertEqual(resolve_receipt_path(report["batch"]["processing_report"], root=self.root), selected)
+        self.assertEqual(report["retained_counts"], processing["processed_counts"])
+
+    def test_selected_batch_cli_revalidates_selected_outputs(self):
+        selected, processing = self.alternative_batch()
+        output = self.root / "data/reports/candidate_review"
+        default_train = resolve_receipt_path(self.processing["outputs"]["train"]["path"], root=self.root)
+        default_train.write_bytes(b"default batch is unusable")
+        with redirect_stdout(io.StringIO()):
+            result = audit_main(["--root", str(self.root), "--processing-report", str(selected),
+                                 "--output-dir", str(output)])
+        self.assertEqual(result, 0)
+        validation = json.loads((output / "structural_validation/validation_report.json").read_text(encoding="utf-8"))
+        for split in ("train", "validation"):
+            self.assertEqual(validation["files"][split]["path"], processing["outputs"][split]["path"])
+
+    def test_missing_selected_receipt_never_falls_back_to_default(self):
+        with self.assertRaises(FileNotFoundError):
+            audit_processed_dataset(self.root, processing_report=self.root / "missing/processing_report.json")
+
+    def test_missing_selected_artifact_never_falls_back_to_default(self):
+        selected, processing = self.alternative_batch()
+        resolve_receipt_path(processing["outputs"]["train"]["path"], root=self.root).unlink()
+        with self.assertRaises(FileNotFoundError):
+            audit_processed_dataset(self.root, processing_report=selected)
+
+    def test_source_report_with_same_name_cannot_replace_bound_reference(self):
+        selected, processing = self.alternative_batch()
+        original = self.fixture.report_path
+        shadow = self.root / "shadow/validation_report.json"
+        shadow.parent.mkdir()
+        shadow.write_bytes(original.read_bytes())
+        original_key = next(name for name in processing["inputs"]
+                            if resolve_receipt_path(name, root=self.root) == original)
+        processing["inputs"][str(shadow)] = processing["inputs"].pop(original_key)
+        processing["input_roles"]["raw_report"] = str(shadow)
+        selected.write_text(json.dumps(processing), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "自引用路径"):
+            audit_processed_dataset(self.root, processing_report=selected)
+
     def test_handwritten_empty_or_unmatched_review_evidence_is_rejected(self):
         original = json.loads(json.dumps(self.fixture.decisions))
         for field, value in (("reason", ""), ("reason", " \n\t"), ("evidence_quotes", []),
@@ -347,6 +420,181 @@ class AuditProcessedDatasetTests(unittest.TestCase):
                 self.refresh_review_chain()
                 with self.assertRaisesRegex(ValueError, "复核理由|证据引文"):
                     audit_processed_dataset(self.root)
+
+    def test_selected_legacy_absolute_batch_migrates_without_rewriting_copy(self):
+        selected, processing = self.alternative_batch()
+        processing["inputs"] = {str(resolve_receipt_path(name, root=self.root)): digest
+                                for name, digest in processing["inputs"].items()}
+        processing["input_roles"] = {name: str(resolve_receipt_path(value, root=self.root))
+                                     for name, value in processing["input_roles"].items()}
+        for artifact in processing["outputs"].values():
+            artifact["path"] = str(resolve_receipt_path(artifact["path"], root=self.root))
+        selected.write_text(json.dumps(processing), encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            copied = Path(directory) / "copy"
+            shutil.copytree(self.root, copied)
+            # 破坏旧位置的来源和新批产物，确保迁移逻辑不依赖仍然存在的旧目录。
+            self.fixture.train_path.write_bytes(b"old source is unusable")
+            Path(processing["outputs"]["train"]["path"]).write_bytes(b"old batch is unusable")
+            copied_receipt = copied / selected.relative_to(self.root)
+            report, _, _ = audit_processed_dataset(copied, processing_report=copied_receipt)
+            self.assertTrue(report["mechanical_checks_passed"])
+            self.assertTrue(all(resolve_receipt_path(value, root=copied).is_relative_to(copied)
+                                for value in report["file_sha256"]))
+
+    def overridden_pipeline(self):
+        """构造训练同标签重复被跨集合隔离完整覆盖的真实多问题计划。"""
+        fixture = pipeline_fixtures.DatasetPipelineTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        fixture.rows["train"].extend([fixture.row("a", "价格 合理", 1), fixture.row("b", "价格 合理", 1)])
+        fixture.rows["validation"].append(fixture.row("validation-a", "价格  合理", 1))
+        fixture.prepare_review()
+        processing, _, _, _ = fixture.process_and_audit()
+        return fixture, processing
+
+    @staticmethod
+    def save_pipeline_application_changes(fixture, processing, applications):
+        """更新测试日志与外层摘要，确保审计必须检查逐条覆盖关系。"""
+        artifact = processing["outputs"]["applications"]
+        path = resolve_receipt_path(artifact["path"], root=fixture.root)
+        path.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in applications), encoding="utf-8")
+        artifact["sha256"] = file_sha256(path)
+        (fixture.root / "data/reports/processed/processing_report.json").write_text(json.dumps(processing), encoding="utf-8")
+
+    def test_overridden_retention_cannot_claim_to_have_been_applied(self):
+        fixture, processing = self.overridden_pipeline()
+        path = resolve_receipt_path(processing["outputs"]["applications"]["path"], root=fixture.root)
+        applications = read_jsonl(path)
+        retained = next(item for item in applications if item["action_type"] == "retain_reviewed_records")
+        self.assertEqual(retained["application_status"], "overridden")
+        retained.update(action_applied=True, application_status="applied", resolution="reviewed_records_retained_unchanged")
+        for record in retained["record_results"]:
+            record.update(decision_applied=True, overridden_by_issue_ids=[])
+        self.save_pipeline_application_changes(fixture, processing, applications)
+        with self.assertRaisesRegex(ValueError, "应用日志"):
+            audit_processed_dataset(fixture.root)
+
+    def test_v2_record_results_cannot_hide_the_action_that_overrode_retention(self):
+        fixture, processing = self.overridden_pipeline()
+        path = resolve_receipt_path(processing["outputs"]["applications"]["path"], root=fixture.root)
+        applications = read_jsonl(path)
+        retained = next(item for item in applications if item["action_type"] == "retain_reviewed_records")
+        retained["record_results"][0]["overridden_by_issue_ids"] = []
+        self.save_pipeline_application_changes(fixture, processing, applications)
+        with self.assertRaisesRegex(ValueError, "逐条生效范围"):
+            audit_processed_dataset(fixture.root)
+
+    def test_v2_final_record_outcomes_are_recomputed_from_the_complete_plan(self):
+        fixture, processing = self.overridden_pipeline()
+        processing["record_outcomes"][0]["disposition"] = "retained"
+        path = fixture.root / "data/reports/processed/processing_report.json"
+        path.write_text(json.dumps(processing), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "最终去向"):
+            audit_processed_dataset(fixture.root)
+
+    def test_legacy_logs_remain_valid_when_no_decision_is_overridden(self):
+        processing = self.processing
+        processing.pop("application_log_version")
+        processing.pop("input_roles")
+        processing.pop("record_outcomes")
+        applications = read_jsonl(resolve_receipt_path(processing["outputs"]["applications"]["path"], root=self.root))
+        for application in applications:
+            application.pop("record_results")
+            application.pop("application_status")
+        self.rewrite_jsonl_artifact("applications", applications)
+        report, _, _ = audit_processed_dataset(self.root)
+        self.assertTrue(report["mechanical_checks_passed"])
+
+    def test_downgrading_overridden_plan_to_legacy_logs_is_rejected(self):
+        fixture, processing = self.overridden_pipeline()
+        processing.pop("application_log_version")
+        processing.pop("input_roles")
+        processing.pop("record_outcomes")
+        applications = read_jsonl(resolve_receipt_path(processing["outputs"]["applications"]["path"], root=fixture.root))
+        for application in applications:
+            application.pop("record_results")
+            application.pop("application_status")
+        self.save_pipeline_application_changes(fixture, processing, applications)
+        with self.assertRaisesRegex(ValueError, "旧版应用日志"):
+            audit_processed_dataset(fixture.root)
+
+    def test_changed_post_validation_configuration_is_rejected(self):
+        artifact = self.processing["outputs"]["validation_report"]
+        path = resolve_receipt_path(artifact["path"], root=self.root)
+        validation = json.loads(path.read_text(encoding="utf-8"))
+        validation["configuration"]["min_class_fraction"] = 0.2
+        path.write_text(json.dumps(validation), encoding="utf-8")
+        artifact["sha256"] = file_sha256(path)
+        self.processing_path.write_text(json.dumps(self.processing), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "校验配置"):
+            audit_processed_dataset(self.root)
+
+    def test_removing_version_cannot_bypass_new_record_outcomes(self):
+        self.processing.pop("application_log_version")
+        self.processing_path.write_text(json.dumps(self.processing), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "字段混用"):
+            audit_processed_dataset(self.root)
+
+    def test_removing_version_and_outcomes_cannot_bypass_new_application_fields(self):
+        self.processing.pop("application_log_version")
+        self.processing.pop("record_outcomes")
+        self.processing_path.write_text(json.dumps(self.processing), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "字段混用"):
+            audit_processed_dataset(self.root)
+
+    def test_no_issue_batch_binds_two_distinct_empty_jsonl_inputs(self):
+        """问题与决定都为空时摘要相同，仍须按各自路径角色完整执行和审计。"""
+        fixture = pipeline_fixtures.DatasetPipelineTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        decisions, _ = fixture.prepare_review()
+        self.assertEqual(decisions, [])
+        processing, report, edits, disputes = fixture.process_and_audit()
+        self.assertTrue(report["mechanical_checks_passed"])
+        self.assertEqual(processing["record_outcomes"], [])
+        self.assertEqual(edits, [])
+        self.assertEqual(disputes, [])
+
+    def test_unsupported_source_rules_cannot_authorize_isolation_after_digest_refresh(self):
+        original_issues = json.loads(json.dumps(self.fixture.issues))
+        original_decisions = json.loads(json.dumps(self.fixture.decisions))
+        cases = (("quarantine_training_conflict_cluster", "within_split_unsupported_rule", "冲突隔离动作"),
+                 ("quarantine_training_overlap", "cross_split_unsupported_rule", "重叠隔离动作"))
+        for action_type, rule, message in cases:
+            with self.subTest(rule=rule):
+                self.fixture.issues = json.loads(json.dumps(original_issues))
+                self.fixture.decisions = json.loads(json.dumps(original_decisions))
+                decision = next(item for item in self.fixture.decisions if item["action"]["type"] == action_type)
+                issue = next(item for item in self.fixture.issues if item["issue_id"] == decision["issue_id"])
+                issue["rule_id"] = decision["rule_id"] = rule
+                self.refresh_source_issue_chain()
+                with self.assertRaisesRegex(ValueError, message):
+                    audit_processed_dataset(self.root)
+
+    def test_conflict_isolation_cannot_be_used_for_a_group_containing_validation(self):
+        decision = next(item for item in self.fixture.decisions if item["action"]["type"] == "quarantine_training_overlap")
+        issue = next(item for item in self.fixture.issues if item["issue_id"] == decision["issue_id"])
+        issue["rule_id"] = decision["rule_id"] = "within_split_normalized_duplicate"
+        decision["action"]["type"] = "quarantine_training_conflict_cluster"
+        applications_path = resolve_receipt_path(self.processing["outputs"]["applications"]["path"], root=self.root)
+        applications = read_jsonl(applications_path)
+        application = next(item for item in applications if item["issue_id"] == decision["issue_id"])
+        application["action_type"] = decision["action"]["type"]
+        self.rewrite_jsonl_artifact("applications", applications)
+        self.refresh_source_issue_chain()
+        with self.assertRaisesRegex(ValueError, "冲突隔离动作"):
+            audit_processed_dataset(self.root)
+
+    def test_clearing_original_conflict_summary_cannot_hide_validation_disputes(self):
+        issue = next(item for item in self.fixture.issues if item["rule_id"].startswith("cross_split_"))
+        self.assertTrue(issue["label_conflicts"])
+        issue["label_conflicts"] = {}
+        self.processing["known_validation_label_disputes"] = []
+        self.refresh_source_issue_chain()
+        with self.assertRaisesRegex(ValueError, "标签冲突明细"):
+            audit_processed_dataset(self.root)
+
 
 if __name__ == "__main__":
     unittest.main()

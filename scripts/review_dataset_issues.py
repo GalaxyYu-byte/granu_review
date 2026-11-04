@@ -20,15 +20,19 @@ import sys
 import unicodedata
 
 try:
-    from .dataset_io import read_jsonl, receipt_origin, receipt_path, resolve_receipt_path
+    from .dataset_io import (
+        file_sha256, read_jsonl, receipt_origin, receipt_path, resolve_receipt_path, write_json_atomic,
+    )
     from .label_config import ASPECT_COLUMNS, CLASS_VALUES, EXPECTED_COLUMNS, parse_label
     from .review_evidence import validate_review_evidence
-    from .validate_dataset import file_sha256, normalize_for_comparison, _write_json_atomic
+    from .validate_dataset import normalize_for_comparison
 except ImportError:
-    from dataset_io import read_jsonl, receipt_origin, receipt_path, resolve_receipt_path
+    from dataset_io import (
+        file_sha256, read_jsonl, receipt_origin, receipt_path, resolve_receipt_path, write_json_atomic,
+    )
     from label_config import ASPECT_COLUMNS, CLASS_VALUES, EXPECTED_COLUMNS, parse_label
     from review_evidence import validate_review_evidence
-    from validate_dataset import file_sha256, normalize_for_comparison, _write_json_atomic
+    from validate_dataset import normalize_for_comparison
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -385,9 +389,9 @@ def main(argv=None) -> int:
                for info in report["files"].values()):
             raise ValueError("复核输出不能写入原始数据目录。")
         output_dir.mkdir(parents=True, exist_ok=True)
-        _write_json_atomic(targets[0], decisions, jsonl=True)
+        write_json_atomic(targets[0], decisions, jsonl=True)
         summary["artifacts"] = {"decisions": receipt_path(targets[0], root=args.root), "decisions_sha256": file_sha256(targets[0])}
-        _write_json_atomic(targets[1], summary)
+        write_json_atomic(targets[1], summary)
     except (OSError, ValueError, KeyError) as error:
         parser.error(str(error))
     print(json.dumps({"reviewed_issues": summary["reviewed_issue_count"], "proposed_quarantine": summary["quarantine_count"],

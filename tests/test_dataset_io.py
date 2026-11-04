@@ -1,12 +1,16 @@
-"""回归验证可迁移的凭据路径，以及 JSONL 按实际文件行读取的边界。"""
+"""回归验证原子报告写入、可迁移凭据路径及 JSONL 的实际行边界。"""
 
 import json
 import os
 from pathlib import Path, PureWindowsPath
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from scripts.dataset_io import read_jsonl, receipt_origin, receipt_path, resolve_receipt_path
+from scripts.dataset_io import (
+    file_sha256, read_jsonl, receipt_origin, receipt_path, resolve_receipt_path, write_json_atomic,
+)
+from scripts import validate_dataset
 
 
 class DatasetIOTests(unittest.TestCase):
@@ -19,6 +23,50 @@ class DatasetIOTests(unittest.TestCase):
         self.root = self.directory / "data" / "current-project"
         self.root.mkdir(parents=True)
         self.report = self.root / "data/reports/raw/validation_report.json"
+
+    def test_atomic_reports_preserve_bytes_and_legacy_imports(self):
+        """公共工具迁移后保持旧导入、UTF-8、排序、缩进和实际行尾格式。"""
+        self.assertIs(validate_dataset.file_sha256, file_sha256)
+        self.assertIs(validate_dataset._write_json_atomic, write_json_atomic)
+        path = self.directory / "report.json"
+        value = {"z": "评论\n下一行\u0085\u2028\u2029", "a": 1}
+        expected = '{\n  "a": 1,\n  "z": "评论\\n下一行\u0085\u2028\u2029"\n}\n'
+
+        write_json_atomic(path, value)
+
+        self.assertEqual(path.read_bytes(), expected.encode("utf-8"))
+        write_json_atomic(path, [value, {"a": 2}], jsonl=True)
+        expected = '{"a": 1, "z": "评论\\n下一行\u0085\u2028\u2029"}\n{"a": 2}\n'
+        self.assertEqual(path.read_bytes(), expected.encode("utf-8"))
+        self.assertEqual(read_jsonl(path), [value, {"a": 2}])
+
+    def test_serialization_failure_preserves_existing_report_and_cleans_temporary_file(self):
+        """序列化在写出部分内容后失败，既有报告也不能被截断或留下临时文件。"""
+        path = self.directory / "report.json"
+        original = b"existing report\n"
+        path.write_bytes(original)
+        before = set(self.directory.iterdir())
+        for jsonl, value in ((False, {"a": 1, "z": object()}),
+                             (True, [{"a": 1}, {"z": object()}])):
+            with self.subTest(jsonl=jsonl):
+                with self.assertRaises(TypeError):
+                    write_json_atomic(path, value, jsonl=jsonl)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(set(self.directory.iterdir()), before)
+
+    def test_publish_failure_preserves_existing_report_and_cleans_temporary_file(self):
+        """临时报告完整写入后若替换失败，继续保留旧报告并清理本次临时文件。"""
+        path = self.directory / "report.json"
+        original = b"existing report\n"
+        path.write_bytes(original)
+        before = set(self.directory.iterdir())
+
+        with patch.object(Path, "replace", side_effect=OSError("cannot publish")):
+            with self.assertRaisesRegex(OSError, "cannot publish"):
+                write_json_atomic(path, {"a": "new report"})
+
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(set(self.directory.iterdir()), before)
 
     def test_project_receipts_are_relative_and_external_receipts_remain_absolute(self):
         """项目内产物应随根目录迁移，外部数据则必须继续保留其明确的绝对位置。"""

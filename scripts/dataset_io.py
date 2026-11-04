@@ -1,17 +1,51 @@
-"""统一读取 JSONL，并在项目迁移时解析报告和处理凭据中的文件路径。
+"""统一文件摘要、JSON/JSONL 读写及可迁移的报告凭据路径。
 
 项目内文件以根目录相对路径保存，项目外输入保留绝对路径。旧版绝对路径
 只有在报告位置能够确定旧项目根目录时才重定位，避免误读其他数据目录。
-本模块仅负责读取和路径换算；文件摘要及内容一致性由调用方核验。
+本模块提供文件操作工具；摘要是否匹配及内容是否一致仍由调用方核验。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path, PurePosixPath, PureWindowsPath
+import tempfile
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def file_sha256(path: Path) -> str:
+    """分块计算文件摘要，避免将整份数据一次读入内存。"""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_json_atomic(path: Path, value, *, jsonl: bool = False):
+    """先在目标目录写临时文件，再原子替换，避免读者看到半份报告。
+
+    每个 JSONL 对象只追加一个真正的换行；字符串内部字符由 JSON 编码器
+    处理。调用方负责判断目标是否允许覆盖，本函数仅保证单文件发布完整。
+    """
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", suffix=".tmp",
+                                         prefix=path.stem + "_", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            if jsonl:
+                for item in value:
+                    stream.write(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n")
+            else:
+                json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+                stream.write("\n")
+        temporary.replace(path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
 
 
 def read_jsonl(path: Path) -> list[dict]:
