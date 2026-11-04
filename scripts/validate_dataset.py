@@ -21,9 +21,9 @@ import sys
 import unicodedata
 
 try:
-    from .dataset_io import file_sha256, receipt_path, write_json_atomic as _write_json_atomic
+    from .dataset_io import file_sha256, large_csv_fields, receipt_path, write_json_atomic as _write_json_atomic
 except ImportError:
-    from dataset_io import file_sha256, receipt_path, write_json_atomic as _write_json_atomic
+    from dataset_io import file_sha256, large_csv_fields, receipt_path, write_json_atomic as _write_json_atomic
 
 
 try:
@@ -412,22 +412,12 @@ def validate_dataset(split_paths: dict[str, Path], output_dir: Path, *, stage: s
     collector = IssueCollector(stage)
     files = {}
     records = []
-    previous_limit = csv.field_size_limit()
-    # 长评论可能超过 CSV 库默认限制；兼容平台整数范围，并在扫描后恢复进程原设置。
-    field_limit = sys.maxsize
-    while True:
-        try:
-            csv.field_size_limit(field_limit)
-            break
-        except OverflowError:
-            field_limit //= 10
-    try:
+    # 与训练读取器共同管理进程级字段上限，持锁覆盖全部 CSV 扫描，防止并发提前恢复。
+    with large_csv_fields():
         for split, path in paths.items():
             files[split], samples = _scan_file(split, path, allowed, collector,
                                                max_text_chars, min_class_fraction)
             records.extend(samples)
-    finally:
-        csv.field_size_limit(previous_limit)
     duplicate_summary = _check_groups(records, collector, id_scope)
     issue_counts = {severity: sum(item["severity"] == severity for item in collector.items)
                     for severity in ("ERROR", "REVIEW", "WARN")}

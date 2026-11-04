@@ -129,7 +129,13 @@ print(sample.sample_id, sample.text, sample.labels)
 
 `load_datasets()` 要求处理报告为 `stage="cleaned_original_label_space"`、`mapping_applied=false`，拒绝已经映射的批次。二次校验必须扫描完整、`validation_gate_passed=true`，最终状态为 `passed` 或 `passed_with_warnings`。已复核放行的问题可以继续保留在 REVIEW 扫描计数中，不以 REVIEW 数量为零作为加载条件。读取器还核对报告与 CSV 的路径、摘要和记录数，完整读完并确认输入未变化后才返回数据；指定批次失败时直接报错，不回退其他批次。
 
+读取 CSV 前，读取器严格核对二次校验报告 `configuration` 中的四项标签配置：`expected_columns` 必须与当前 `EXPECTED_COLUMNS` 的列名和方面顺序一致，`allowed_labels` 必须与 `CLASS_VALUES` 的原始类别及顺序一致，`label_mapping` 必须与 `LABEL_MAPPING` 一致，`raw_label_meanings` 必须与 `RAW_LABEL_MEANINGS` 的类别含义一致。四项均为必填；列表严格检查类型和顺序，映射键必须完整且无额外项，类别编号必须为整数（不接受布尔值、浮点数或字符串），类别含义必须为约定的字符串。JSON 对象的键顺序不影响判定。缺失或冲突时，即使报告摘要已更新也会报错，并指出具体字段；调整方面顺序、类别顺序或含义后，须按新配置重新校验并生成处理凭据。
+
+处理报告的 `post_validation_issue_counts`、二次校验报告的 `pending_reviews` 和每个集合的 `sha256_after_scan` 在支持的 1.0、1.1 批次中均为必填。问题计数必须与二次校验一致，待复核数必须精确为整数 `0`，扫描后摘要必须为有效 SHA-256 且与所选 CSV 一致；缺失、空值或类型错误均在加载样本前拒绝，不补默认值。
+
 路径相对于 `root` 解析，默认 `root` 为脚本所在项目根目录。现有绝对路径凭据和新相对路径凭据均支持随项目副本迁移。完整来源审计仍通过 `audit_processed_dataset.py` 单独执行，读取器只核对本次加载所需的文件和报告绑定。
+
+读取器和校验器共用 `dataset_io.large_csv_fields()` 管理进程级 CSV 字段上限。同进程不同线程的 CSV 解析阶段使用同一把锁，避免一个操作提前恢复上限而使另一个长评论解析失败；同线程嵌套允许重入，正常结束或异常后均恢复原上限。包导入与直接脚本导入也共用该锁。
 
 只读验证默认批次，可执行以下任一命令，终端输出样本数量、标签形状、类别范围和来源摘要的 JSON 汇总，不生成或改写数据文件：
 
@@ -147,7 +153,7 @@ uv run python .\scripts\dataset_reader.py --root D:\dataset_copy
 
 需要独立读取一份明确使用原始标签的 CSV 时，可以调用 `read_split(path, split="train")` 或 `read_split(path, split="validation")`。可选的 `expected_sha256` 绑定预期文件摘要；`load_datasets()` 会自动传入处理凭据的摘要，并核对实际送入 CSV 解析器的字节。该入口不核验处理报告；仅凭 CSV 中的数值无法始终判断它是否已经映射，因此正式训练应使用 `load_datasets()`。
 
-两个入口均严格处理表头、列宽、ID、空白文本、UTF-8/CSV 解析和标签错误，失败时提供记录定位信息。读取保留原文、ID 和顺序，不自动跳过坏记录；分词、截断、padding、张量转换和训练打乱由后续模型适配层负责。
+两个入口均严格处理表头、列宽、ID、空白文本、UTF-8/CSV 解析和标签错误，失败时提供记录定位信息。UTF-8 解码失败时报告当前记录号和坏字节所在的物理行号；表头的记录号为 `0`，尚未解析出记录时为 `id=None`。读取保留原文、ID 和顺序，不自动跳过坏记录；分词、截断、padding、张量转换和训练打乱由后续模型适配层负责。
 
 本批真实数据读取验证（2026-11-04）：训练集 104,969 条、验证集 15,000 条，标签形状分别为 `[104969, 20]`、`[15000, 20]`，编码范围为 `0～3`。另行按 CSV 逐条核对全部 119,969 条记录的 ID、顺序、原文和位置，并反解比较全部 2,399,380 个标签；20 个方面的分布均与二次校验报告一致。验证样本 `13036`、`14365` 保留原标签。验证脚本和结果保存于本地 `data/reports/dataset_reader/verify_reading.py`、`reading_verification.json`，既有数据与报告的摘要均未改变。
 

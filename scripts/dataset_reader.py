@@ -1,14 +1,13 @@
 """严格读取清洗后、尚未映射标签的评论数据，供训练与评估共用。
 
 单文件入口只保证 CSV 和原始标签可用；正式训练通过处理凭据选择批次，
-核对二次校验、路径、摘要和条数后才返回完整样本。读取不改变文本、ID、
+核对二次校验、标签配置、路径、摘要和条数后才返回完整样本。读取不改变文本、ID、
 顺序或磁盘标签，也不负责分词、张量转换以及完整来源审计。
 """
 
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 import csv
 from dataclasses import dataclass
 import hashlib
@@ -16,19 +15,26 @@ import io
 import json
 from pathlib import Path, PureWindowsPath
 import sys
-from threading import RLock
 
 try:
-    from .dataset_io import PROJECT_ROOT, file_sha256, receipt_origin, resolve_receipt_path
-    from .label_config import CLASS_VALUES, EXPECTED_COLUMNS, NUM_ASPECTS, NUM_CLASSES, encode_labels, get_label_config
+    from .dataset_io import (
+        PROJECT_ROOT, file_sha256, large_csv_fields as _large_csv_fields, receipt_origin, resolve_receipt_path,
+    )
+    from .label_config import (
+        CLASS_VALUES, EXPECTED_COLUMNS, LABEL_MAPPING, NUM_ASPECTS, NUM_CLASSES, RAW_LABEL_MEANINGS,
+        encode_labels, get_label_config,
+    )
 except ImportError:
-    from dataset_io import PROJECT_ROOT, file_sha256, receipt_origin, resolve_receipt_path
-    from label_config import CLASS_VALUES, EXPECTED_COLUMNS, NUM_ASPECTS, NUM_CLASSES, encode_labels, get_label_config
+    from dataset_io import (
+        PROJECT_ROOT, file_sha256, large_csv_fields as _large_csv_fields, receipt_origin, resolve_receipt_path,
+    )
+    from label_config import (
+        CLASS_VALUES, EXPECTED_COLUMNS, LABEL_MAPPING, NUM_ASPECTS, NUM_CLASSES, RAW_LABEL_MEANINGS,
+        encode_labels, get_label_config,
+    )
 
 
 SPLITS = ("train", "validation")
-# CSV 字段上限属于进程全局设置；串行管理本模块的读取，避免两个读取器相互恢复上限。
-_CSV_FIELD_LOCK = RLock()
 
 
 class DatasetReadError(ValueError):
@@ -54,6 +60,25 @@ class _HashingReader(io.RawIOBase):
         return count
 
 
+class _UTF8Lines:
+    """按物理行严格解码，避免文本缓冲提前解码后续记录而误报位置。"""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.line_num = 0
+
+    def __iter__(self):
+        """供 CSV 解析器按需取得下一物理行。"""
+        return self
+
+    def __next__(self):
+        """先记录当前行号，解码失败时也能定位到坏字节所在行。"""
+        line = next(self.stream)
+        self.line_num += 1
+        encoding = "utf-8-sig" if self.line_num == 1 else "utf-8"
+        return line.encode("latin-1").decode(encoding)
+
+
 @dataclass(frozen=True, slots=True)
 class ReviewSample:
     """不可变样本；位置均属于当前清洗后 CSV，不能据此推算原始行号。"""
@@ -74,26 +99,6 @@ class DatasetBundle:
     validation: list[ReviewSample]
     label_config: dict[str, list]
     sources: dict[str, dict[str, str]]
-
-
-@contextmanager
-def _large_csv_fields():
-    """沿用校验器的长字段策略，成功、失败时都恢复调用前的全局上限。"""
-    with _CSV_FIELD_LOCK:
-        previous_limit = csv.field_size_limit()
-        try:
-            field_limit = sys.maxsize
-            while True:
-                try:
-                    csv.field_size_limit(field_limit)
-                    break
-                except OverflowError:
-                    field_limit //= 10
-                    if not field_limit:
-                        raise DatasetReadError("当前平台无法设置 CSV 字段上限。")
-            yield
-        finally:
-            csv.field_size_limit(previous_limit)
 
 
 def _fingerprint(path: Path) -> str:
@@ -122,18 +127,20 @@ def read_split(path: str | Path, *, split: str, expected_sha256: str | None = No
     seen: dict[str, int] = {}
     number = 0
     sample_id = None
-    reader = None
+    lines = None
 
     def location() -> str:
         """错误位置按 CSV 记录计数；多行评论的物理行号另列。"""
         return (f"{path} [split={split}, processed_record_number={number}, "
-                f"physical_line_end={reader.line_num if reader is not None else 0}, id={sample_id!r}]")
+                f"physical_line_end={lines.line_num if lines is not None else 0}, id={sample_id!r}]")
 
     try:
         with _large_csv_fields(), path.open("rb", buffering=0) as source:
             hashed = _HashingReader(source)
-            with io.TextIOWrapper(io.BufferedReader(hashed), encoding="utf-8-sig", newline="") as stream:
-                reader = csv.reader(stream, strict=True)
+            # 单字节映射仅用于原样分出 CR/LF/CRLF 物理行，UTF-8 校验延后到消费当前行。
+            with io.TextIOWrapper(io.BufferedReader(hashed), encoding="latin-1", newline="") as stream:
+                lines = _UTF8Lines(stream)
+                reader = csv.reader(lines, strict=True)
                 header = next(reader, None)
                 if header != list(EXPECTED_COLUMNS):
                     raise DatasetReadError(f"{location()}：表头缺失，或列名、顺序与 EXPECTED_COLUMNS 不一致。")
@@ -255,17 +262,29 @@ def load_datasets(processing_report: str | Path, *, root: str | Path | None = No
              f"{validation_context}：二次校验扫描不完整或最终状态未通过。")
     _require(validation["status"] == processing.get("post_validation_status"), f"{context}：二次校验最终状态与处理凭据不一致。")
     counts = _issue_counts(validation.get("issue_counts"), f"{validation_context}.issue_counts")
-    if "post_validation_issue_counts" in processing:
-        processing_counts = _issue_counts(processing["post_validation_issue_counts"], f"{context}.post_validation_issue_counts")
-        _require(counts == processing_counts, f"{context}：二次校验问题计数与处理凭据不一致。")
-    if "pending_reviews" in validation:
-        pending = validation["pending_reviews"]
-        _require(type(pending) is int and pending == 0, f"{validation_context}：仍有未完成的复核。")
-    configuration = _object(validation.get("configuration"), f"{validation_context}.configuration")
+    # 三项凭据在历史 1.0 中也已生成，缺失不能被解释为旧版本兼容或默认通过。
+    processing_counts = _issue_counts(processing.get("post_validation_issue_counts"), f"{context}.post_validation_issue_counts")
+    _require(counts == processing_counts, f"{context}：二次校验问题计数与处理凭据不一致。")
+    pending = validation.get("pending_reviews")
+    _require(type(pending) is int and pending == 0,
+             f"{validation_context}.pending_reviews 必须为整数 0，不能缺失或存在未完成的复核。")
+    configuration_context = f"{validation_context}.configuration"
+    configuration = _object(validation.get("configuration"), configuration_context)
     allowed = configuration.get("allowed_labels")
     _require(isinstance(allowed, list) and all(type(value) is int for value in allowed)
-             and allowed == list(CLASS_VALUES), f"{validation_context}：合法标签配置与原始标签域不一致。")
-    _require(configuration.get("expected_columns") == list(EXPECTED_COLUMNS), f"{validation_context}：列配置与当前规范不一致。")
+             and allowed == list(CLASS_VALUES), f"{configuration_context}.allowed_labels 与当前原始类别及顺序不一致。")
+    columns = configuration.get("expected_columns")
+    _require(isinstance(columns, list) and all(type(value) is str for value in columns)
+             and columns == list(EXPECTED_COLUMNS), f"{configuration_context}.expected_columns 与当前列名和方面顺序不一致。")
+    label_mapping = _object(configuration.get("label_mapping"), f"{configuration_context}.label_mapping")
+    # JSON 对象的键顺序不影响映射；编号需严格为整数，避免 False/0.0 与 0 比较相等。
+    _require(all(type(value) is int for value in label_mapping.values())
+             and label_mapping == {str(raw): encoded for raw, encoded in LABEL_MAPPING.items()},
+             f"{configuration_context}.label_mapping 与当前标签映射不一致。")
+    meanings = _object(configuration.get("raw_label_meanings"), f"{configuration_context}.raw_label_meanings")
+    _require(all(type(value) is str for value in meanings.values())
+             and meanings == {str(raw): meaning for raw, meaning in RAW_LABEL_MEANINGS.items()},
+             f"{configuration_context}.raw_label_meanings 与当前类别含义不一致。")
     artifacts = _object(validation.get("artifacts"), f"{validation_context}.artifacts")
     recorded_self = _receipt_string(artifacts.get("report"), f"{validation_context}.artifacts.report")
     post_origin = receipt_origin(recorded_self, validation_path, root)
@@ -283,8 +302,8 @@ def load_datasets(processing_report: str | Path, *, root: str | Path | None = No
                  and info.get("sha256") == fingerprints[split] and scanned_count == expected_count,
                  f"{validation_context} [split={split}]：CSV 路径、摘要或记录数与处理凭据不一致。")
         _require(info.get("scan_complete") is True, f"{validation_context} [split={split}]：集合扫描不完整。")
-        if "sha256_after_scan" in info:
-            _require(info["sha256_after_scan"] == fingerprints[split], f"{validation_context} [split={split}]：校验期间 CSV 摘要变化。")
+        after_scan = _sha256(info.get("sha256_after_scan"), f"{validation_context}.files.{split}.sha256_after_scan")
+        _require(after_scan == fingerprints[split], f"{validation_context} [split={split}]：校验期间 CSV 摘要变化。")
         _require(_fingerprint(paths[split]) == fingerprints[split], f"{paths[split]} [split={split}]：CSV SHA-256 摘要不匹配。")
     # 不逐条向外产出：验证集失败时，调用方也不会拿到一份看似可用的训练集。
     loaded = {split: read_split(paths[split], split=split, expected_sha256=fingerprints[split]) for split in SPLITS}

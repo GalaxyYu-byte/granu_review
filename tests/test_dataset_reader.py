@@ -22,7 +22,7 @@ from unittest.mock import patch
 from scripts import dataset_reader
 from scripts.dataset_io import file_sha256, receipt_path
 from scripts.dataset_reader import DatasetReadError, load_datasets, read_split
-from scripts.label_config import ASPECT_COLUMNS, CLASS_VALUES, EXPECTED_COLUMNS, get_label_config
+from scripts.label_config import ASPECT_COLUMNS, CLASS_VALUES, EXPECTED_COLUMNS, RAW_LABEL_MEANINGS, get_label_config
 from scripts.validate_dataset import validate_dataset
 
 
@@ -209,6 +209,67 @@ class DatasetReaderTests(unittest.TestCase):
                 with self.assertRaises(DatasetReadError):
                     read_split(self.single, split="validation")
 
+    def test_invalid_utf8_reports_actual_record_and_physical_line(self):
+        """后续记录的坏字节不能在表头预读时误报，跨行记录也按真实物理行定位。"""
+        cases = [
+            ("前条评论", "坏字节位置", 3),
+            ("前条评论\r\n续行", "坏字节位置", 4),
+            ("前条评论", "当前评论\r\n坏字节位置", 4),
+        ]
+        for newline in (b"\n", b"\r\n", b"\r"):
+            for first_text, bad_text, physical_line in cases:
+                with self.subTest(newline=newline, first_text=first_text, bad_text=bad_text):
+                    self.write_csv(self.single, [self.row("previous-id", first_text),
+                                                 self.row("bad-id", bad_text)])
+                    content = self.single.read_bytes().replace(b"\r\n", newline)
+                    content = content.replace("坏字节位置".encode("utf-8"), b"\xff")
+                    self.single.write_bytes(content)
+
+                    with self.assertRaises(DatasetReadError) as raised:
+                        read_split(self.single, split="validation")
+
+                    message = str(raised.exception)
+                    self.assertIn(str(self.single), message)
+                    self.assertIn("split=validation,", message)
+                    self.assertIn("processed_record_number=2,", message)
+                    self.assertIn(f"physical_line_end={physical_line},", message)
+                    self.assertIn("id=None", message)
+                    self.assertNotIn("previous-id", message)
+                    self.assertIsInstance(raised.exception.__cause__, UnicodeDecodeError)
+                    self.assertEqual(self.single.read_bytes(), content)
+
+    def test_invalid_utf8_in_header_reports_first_physical_line(self):
+        """表头没有样本记录号，但解码失败的位置仍是物理第 1 行。"""
+        header = (",".join(EXPECTED_COLUMNS) + "\n").encode("utf-8")
+        for bom in (b"", b"\xef\xbb\xbf"):
+            with self.subTest(bom=bom):
+                self.single.write_bytes(bom + header.replace(b"id", b"\xff", 1))
+                with self.assertRaises(DatasetReadError) as raised:
+                    read_split(self.single, split="train")
+
+                message = str(raised.exception)
+                self.assertIn("processed_record_number=0,", message)
+                self.assertIn("physical_line_end=1,", message)
+                self.assertIn("id=None", message)
+                self.assertIsInstance(raised.exception.__cause__, UnicodeDecodeError)
+
+    def test_truncated_utf8_at_eof_reports_current_record_and_line(self):
+        """末尾缺失多字节字符的后续字节时，也必须保留当前记录和实际行号。"""
+        for newline in (b"\n", b"\r\n", b"\r"):
+            with self.subTest(newline=newline):
+                self.write_csv(self.single, [self.row("previous-id", "前条评论")])
+                content = self.single.read_bytes().replace(b"\r\n", newline)
+                self.single.write_bytes(content + b'bad-id,"truncated \xe4\xb8')
+                with self.assertRaises(DatasetReadError) as raised:
+                    read_split(self.single, split="train")
+
+                message = str(raised.exception)
+                self.assertIn("processed_record_number=2,", message)
+                self.assertIn("physical_line_end=3,", message)
+                self.assertIn("id=None", message)
+                self.assertNotIn("previous-id", message)
+                self.assertIsInstance(raised.exception.__cause__, UnicodeDecodeError)
+
     def test_missing_file_and_unknown_split_are_explicit_errors(self):
         """不存在的文件或未知集合名称不能产生空数据。"""
         with self.assertRaises(DatasetReadError):
@@ -240,6 +301,11 @@ class DatasetReaderTests(unittest.TestCase):
         for version in ("1.0", "1.1"):
             with self.subTest(version=version):
                 batch = self.make_batch("version_" + version, schema_version=version)
+                self.assertEqual(batch.validation["pending_reviews"], 0)
+                self.assertIn("post_validation_issue_counts", batch.processing)
+                for split in FILENAMES:
+                    self.assertEqual(batch.validation["files"][split]["sha256_after_scan"],
+                                     batch.processing["outputs"][split]["sha256"])
                 before = {path: path.read_bytes()
                           for path in (*batch.paths.values(), batch.processing_path, batch.validation_path)}
                 bundle = load_datasets(batch.processing_path, root=self.root)
@@ -302,6 +368,189 @@ class DatasetReaderTests(unittest.TestCase):
         batch.validation_path.write_text(batch.validation_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
         with self.assertRaises(DatasetReadError):
             load_datasets(batch.processing_path, root=self.root)
+
+    def test_rejects_swapped_report_label_mapping_before_reading_samples(self):
+        """刷新报告摘要也不能让报告类别顺序偏离训练编码规则。"""
+        for version in ("1.0", "1.1"):
+            with self.subTest(version=version):
+                batch = self.make_batch("swapped_mapping_" + version, schema_version=version)
+                mapping = batch.validation["configuration"]["label_mapping"]
+                mapping["-2"], mapping["1"] = mapping["1"], mapping["-2"]
+                self.save_validation(batch)
+                with patch.object(dataset_reader, "read_split", wraps=read_split) as reader:
+                    with self.assertRaisesRegex(DatasetReadError, r"configuration\.label_mapping"):
+                        load_datasets(batch.processing_path, root=self.root)
+                    reader.assert_not_called()
+
+    def test_rejects_invalid_report_label_mappings_before_reading_samples(self):
+        """映射必须完整且严格使用整数编号，不能靠缺省值或隐式相等通过。"""
+        expected = {str(raw): index for index, raw in enumerate(CLASS_VALUES)}
+        cases = [
+            ("missing_field", None),
+            ("null", None),
+            ("list", list(expected.items())),
+            ("missing_key", {key: value for key, value in expected.items() if key != "-2"}),
+            ("extra_key", {**expected, "2": 4}),
+            ("wrong_number", {**expected, "-2": 4}),
+            ("boolean", {**expected, "-2": False}),
+            ("float", {**expected, "-2": 0.0}),
+            ("string_number", {**expected, "-2": "0"}),
+        ]
+        for version in ("1.0", "1.1"):
+            for name, mapping in cases:
+                with self.subTest(version=version, case=name):
+                    batch = self.make_batch("invalid_mapping_" + version + "_" + name,
+                                            schema_version=version)
+                    configuration = batch.validation["configuration"]
+                    if name == "missing_field":
+                        del configuration["label_mapping"]
+                    else:
+                        configuration["label_mapping"] = deepcopy(mapping)
+                    self.save_validation(batch)
+                    with patch.object(dataset_reader, "read_split", wraps=read_split) as reader:
+                        with self.assertRaisesRegex(DatasetReadError, r"configuration\.label_mapping"):
+                            load_datasets(batch.processing_path, root=self.root)
+                        reader.assert_not_called()
+
+    def test_loads_report_label_mapping_with_reordered_json_keys(self):
+        """映射对象的键顺序不改变语义，两个集合仍按类别定义顺序编码。"""
+        for version in ("1.0", "1.1"):
+            with self.subTest(version=version):
+                batch = self.make_batch("reordered_mapping_" + version, schema_version=version)
+                mapping = batch.validation["configuration"]["label_mapping"]
+                batch.validation["configuration"]["label_mapping"] = dict(reversed(list(mapping.items())))
+                self.save_validation(batch)
+
+                bundle = load_datasets(batch.processing_path, root=self.root)
+
+                self.assertEqual(bundle.label_config["class_values"], list(CLASS_VALUES))
+                for split in FILENAMES:
+                    for shift, sample in enumerate(getattr(bundle, split)):
+                        with self.subTest(split=split, sample=sample.sample_id):
+                            self.assertEqual(sample.labels,
+                                             tuple((index + shift) % len(CLASS_VALUES)
+                                                   for index in range(len(ASPECT_COLUMNS))))
+
+    def test_rejects_incompatible_report_aspect_columns_before_reading_samples(self):
+        """报告方面轴必须与编码器一致，更新摘要不能掩盖顺序或结构变化。"""
+        expected = list(EXPECTED_COLUMNS)
+        swapped = expected.copy()
+        swapped[2], swapped[3] = swapped[3], swapped[2]
+        duplicate = expected.copy()
+        duplicate[3] = duplicate[2]
+        cases = [
+            ("missing_field", None),
+            ("null", None),
+            ("swapped_aspects", swapped),
+            ("missing_aspect", expected[:-1]),
+            ("duplicate_aspect", duplicate),
+            ("extra_aspect", [*expected, "invented_aspect"]),
+            ("wrong_type", {"columns": expected}),
+            ("non_string_column", [*expected[:-1], False]),
+        ]
+        for version in ("1.0", "1.1"):
+            for name, columns in cases:
+                with self.subTest(version=version, case=name):
+                    batch = self.make_batch("invalid_columns_" + version + "_" + name,
+                                            schema_version=version)
+                    configuration = batch.validation["configuration"]
+                    if name == "missing_field":
+                        del configuration["expected_columns"]
+                    else:
+                        configuration["expected_columns"] = deepcopy(columns)
+                    self.save_validation(batch)
+                    with patch.object(dataset_reader, "read_split", wraps=read_split) as reader:
+                        with self.assertRaises(DatasetReadError):
+                            load_datasets(batch.processing_path, root=self.root)
+                        reader.assert_not_called()
+
+    def test_rejects_incompatible_report_allowed_labels_before_reading_samples(self):
+        """类别域的顺序、完整性和严格整数类型均应在加载样本前核对。"""
+        expected = list(CLASS_VALUES)
+        swapped = expected.copy()
+        swapped[0], swapped[-1] = swapped[-1], swapped[0]
+        cases = [
+            ("missing_field", None),
+            ("null", None),
+            ("swapped_classes", swapped),
+            ("missing_class", expected[:-1]),
+            ("duplicate_class", [*expected[:-1], expected[-2]]),
+            ("extra_class", [*expected, 2]),
+            ("wrong_type", {"labels": expected}),
+            ("boolean", [*expected[:-1], True]),
+            ("float", [*expected[:2], 0.0, *expected[3:]]),
+            ("string_number", [str(value) for value in expected]),
+        ]
+        for version in ("1.0", "1.1"):
+            for name, labels in cases:
+                with self.subTest(version=version, case=name):
+                    batch = self.make_batch("invalid_allowed_" + version + "_" + name,
+                                            schema_version=version)
+                    configuration = batch.validation["configuration"]
+                    if name == "missing_field":
+                        del configuration["allowed_labels"]
+                    else:
+                        configuration["allowed_labels"] = deepcopy(labels)
+                    self.save_validation(batch)
+                    with patch.object(dataset_reader, "read_split", wraps=read_split) as reader:
+                        with self.assertRaises(DatasetReadError):
+                            load_datasets(batch.processing_path, root=self.root)
+                        reader.assert_not_called()
+
+    def test_rejects_incompatible_report_label_meanings_before_reading_samples(self):
+        """映射编号相同也必须拒绝类别含义冲突、缺失及类型不合法的报告。"""
+        expected = {str(raw): meaning for raw, meaning in RAW_LABEL_MEANINGS.items()}
+        swapped = expected.copy()
+        swapped["-2"], swapped["1"] = swapped["1"], swapped["-2"]
+        cases = [
+            ("missing_field", None),
+            ("null", None),
+            ("list", list(expected.items())),
+            ("swapped_meanings", swapped),
+            ("missing_key", {key: value for key, value in expected.items() if key != "-2"}),
+            ("extra_key", {**expected, "2": "invented"}),
+            ("wrong_meaning", {**expected, "-2": "invented"}),
+            ("empty_meaning", {**expected, "-2": ""}),
+            ("boolean_meaning", {**expected, "-2": False}),
+            ("number_meaning", {**expected, "-2": 0}),
+            ("null_meaning", {**expected, "-2": None}),
+            ("list_meaning", {**expected, "-2": []}),
+            ("object_meaning", {**expected, "-2": {}}),
+        ]
+        for version in ("1.0", "1.1"):
+            for name, meanings in cases:
+                with self.subTest(version=version, case=name):
+                    batch = self.make_batch("invalid_meanings_" + version + "_" + name,
+                                            schema_version=version)
+                    configuration = batch.validation["configuration"]
+                    if name == "missing_field":
+                        del configuration["raw_label_meanings"]
+                    else:
+                        configuration["raw_label_meanings"] = deepcopy(meanings)
+                    self.save_validation(batch)
+                    with patch.object(dataset_reader, "read_split", wraps=read_split) as reader:
+                        with self.assertRaisesRegex(DatasetReadError, r"configuration\.raw_label_meanings"):
+                            load_datasets(batch.processing_path, root=self.root)
+                        reader.assert_not_called()
+
+    def test_loads_report_label_meanings_with_reordered_json_keys(self):
+        """含义对象的键顺序不影响类别语义或两集合的标签编码。"""
+        for version in ("1.0", "1.1"):
+            with self.subTest(version=version):
+                batch = self.make_batch("reordered_meanings_" + version, schema_version=version)
+                meanings = batch.validation["configuration"]["raw_label_meanings"]
+                batch.validation["configuration"]["raw_label_meanings"] = dict(reversed(list(meanings.items())))
+                self.save_validation(batch)
+
+                bundle = load_datasets(batch.processing_path, root=self.root)
+
+                self.assertEqual(bundle.label_config, get_label_config())
+                for split in FILENAMES:
+                    for shift, sample in enumerate(getattr(bundle, split)):
+                        with self.subTest(split=split, sample=sample.sample_id):
+                            self.assertEqual(sample.labels,
+                                             tuple((index + shift) % len(CLASS_VALUES)
+                                                   for index in range(len(ASPECT_COLUMNS))))
 
     def test_selects_only_requested_batch_and_never_falls_back_on_missing_files(self):
         """默认批次存在时，显式指定的 v2 仍独立加载，缺文件立即失败。"""
@@ -386,6 +635,87 @@ class DatasetReaderTests(unittest.TestCase):
                 self.save_validation(batch)
                 with self.assertRaises(DatasetReadError):
                     load_datasets(batch.processing_path, root=self.root)
+
+    def test_rejects_missing_post_validation_issue_counts_before_reading_samples(self):
+        """两个支持版本都必须提供处理完成时的问题计数，不能跳过报告间对账。"""
+        for version in ("1.0", "1.1"):
+            with self.subTest(version=version):
+                batch = self.make_batch("missing_counts_" + version, schema_version=version)
+                del batch.processing["post_validation_issue_counts"]
+                self.save_processing(batch)
+                with patch.object(dataset_reader, "read_split", wraps=read_split) as reader:
+                    with self.assertRaises(DatasetReadError):
+                        load_datasets(batch.processing_path, root=self.root)
+                    reader.assert_not_called()
+
+    def test_rejects_missing_pending_reviews_before_reading_samples(self):
+        """两个支持版本均须明确声明待复核数，删除字段不能被解释为零。"""
+        for version in ("1.0", "1.1"):
+            with self.subTest(version=version):
+                batch = self.make_batch("missing_pending_" + version, schema_version=version)
+                del batch.validation["pending_reviews"]
+                self.save_validation(batch)
+                with patch.object(dataset_reader, "read_split", wraps=read_split) as reader:
+                    with self.assertRaises(DatasetReadError):
+                        load_datasets(batch.processing_path, root=self.root)
+                    reader.assert_not_called()
+
+    def test_rejects_missing_after_scan_hash_before_reading_samples(self):
+        """任一集合缺少扫描结束摘要时，两个报告版本均不能声明输入完整。"""
+        for version in ("1.0", "1.1"):
+            for split in FILENAMES:
+                with self.subTest(version=version, split=split):
+                    batch = self.make_batch("missing_after_" + version + "_" + split, schema_version=version)
+                    del batch.validation["files"][split]["sha256_after_scan"]
+                    self.save_validation(batch)
+                    with patch.object(dataset_reader, "read_split", wraps=read_split) as reader:
+                        with self.assertRaises(DatasetReadError):
+                            load_datasets(batch.processing_path, root=self.root)
+                        reader.assert_not_called()
+
+    def test_rejects_invalid_processing_issue_counts_before_reading_samples(self):
+        """必需问题计数不能以 null、布尔值、数组或缺少级别的对象代替。"""
+        cases = [None, True, False, 0, 0.0, "0", [], {},
+                 {"ERROR": 0, "REVIEW": True, "WARN": 0}]
+        for version in ("1.0", "1.1"):
+            for index, value in enumerate(cases):
+                with self.subTest(version=version, value=value):
+                    batch = self.make_batch(f"invalid_counts_{version}_{index}", schema_version=version)
+                    batch.processing["post_validation_issue_counts"] = value
+                    self.save_processing(batch)
+                    with patch.object(dataset_reader, "read_split", wraps=read_split) as reader:
+                        with self.assertRaises(DatasetReadError):
+                            load_datasets(batch.processing_path, root=self.root)
+                        reader.assert_not_called()
+
+    def test_rejects_invalid_pending_review_counts_before_reading_samples(self):
+        """待复核字段必须是精确整数零，False、0.0 或字符串零均不能放行。"""
+        cases = [None, True, False, 0.0, "0", [], {}, 1, -1]
+        for version in ("1.0", "1.1"):
+            for index, value in enumerate(cases):
+                with self.subTest(version=version, value=value):
+                    batch = self.make_batch(f"invalid_pending_{version}_{index}", schema_version=version)
+                    batch.validation["pending_reviews"] = value
+                    self.save_validation(batch)
+                    with patch.object(dataset_reader, "read_split", wraps=read_split) as reader:
+                        with self.assertRaises(DatasetReadError):
+                            load_datasets(batch.processing_path, root=self.root)
+                        reader.assert_not_called()
+
+    def test_rejects_invalid_after_scan_hashes_before_reading_samples(self):
+        """每个集合的结束摘要必须是合法 SHA-256，且与凭据声明的输入相同。"""
+        cases = [None, True, False, 0, 0.0, [], {}, "invalid", "A" * 64, "0" * 64]
+        for version in ("1.0", "1.1"):
+            for split in FILENAMES:
+                for index, value in enumerate(cases):
+                    with self.subTest(version=version, split=split, value=value):
+                        batch = self.make_batch(f"invalid_after_{version}_{split}_{index}", schema_version=version)
+                        batch.validation["files"][split]["sha256_after_scan"] = value
+                        self.save_validation(batch)
+                        with patch.object(dataset_reader, "read_split", wraps=read_split) as reader:
+                            with self.assertRaises(DatasetReadError):
+                                load_datasets(batch.processing_path, root=self.root)
+                            reader.assert_not_called()
 
     def test_validation_file_bindings_must_match_paths_hashes_and_counts(self):
         """即使报告摘要同步更新，二次校验也必须绑定同一文件而非另一份副本。"""

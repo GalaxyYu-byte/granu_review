@@ -1,4 +1,4 @@
-"""统一文件摘要、JSON/JSONL 读写及可迁移的报告凭据路径。
+"""统一 CSV 字段上限、文件摘要、JSON/JSONL 读写及可迁移的报告凭据路径。
 
 项目内文件以根目录相对路径保存，项目外输入保留绝对路径。旧版绝对路径
 只有在报告位置能够确定旧项目根目录时才重定位，避免误读其他数据目录。
@@ -7,13 +7,45 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import csv
 import hashlib
 import json
 from pathlib import Path, PurePosixPath, PureWindowsPath
+import sys
 import tempfile
+from threading import RLock
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# 直接脚本导入 dataset_io 与包导入 scripts.dataset_io 可能产生两份模块实例。
+# 字段上限属于同一个标准库 csv 模块，锁也绑定到该对象，避免混合导入创建两把锁。
+_CSV_FIELD_LOCK = csv.__dict__.setdefault("_granu_review_field_size_lock", RLock())
+
+
+@contextmanager
+def large_csv_fields():
+    """持共享锁覆盖完整 CSV 解析，结束或异常时恢复调用前的进程级上限。
+
+    读取器与校验器必须共同使用该入口，不能各自设置和恢复上限。锁覆盖
+    yield 内的解析过程；同线程嵌套可重入，不同线程等待当前解析完成。
+    """
+    with _CSV_FIELD_LOCK:
+        previous_limit = csv.field_size_limit()
+        try:
+            field_limit = sys.maxsize
+            while True:
+                try:
+                    # 平台回退候选也不能降低调用方已经设置的有效上限。
+                    csv.field_size_limit(max(previous_limit, field_limit))
+                    break
+                except OverflowError:
+                    field_limit //= 10
+                    if not field_limit:
+                        raise
+            yield
+        finally:
+            csv.field_size_limit(previous_limit)
 
 
 def file_sha256(path: Path) -> str:
